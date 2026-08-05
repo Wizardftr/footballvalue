@@ -134,18 +134,41 @@ def roi_confidence_interval(
 
 
 def summarize_clv(clv_values: pd.Series) -> dict[str, float]:
-    """CLV summary. The share of bets beating the close matters as much as the mean.
+    """CLV summary, with the interval and the hit rate alongside the mean.
 
-    CLV is the leading indicator: it resolves on every bet immediately, rather than
-    waiting for outcomes to average out, so it reaches statistical significance far
-    sooner than ROI does.
+    CLV is the leading indicator: it resolves on every bet immediately rather than
+    waiting for outcomes to average out, so it reaches significance far sooner than
+    ROI does. But a positive *mean* on its own proves nothing, and reporting it
+    alone is the easiest way to fool yourself on this project.
+
+    CLV is heavily tailed, so a handful of large favourable moves can drag the mean
+    positive while the model is on the wrong side of the line more often than not.
+    The mean, its confidence interval, and ``pct_positive`` have to be read together:
+    a positive mean with ``pct_positive`` below 0.5 is outlier-driven noise, not
+    evidence of an edge. ``pct_positive_moved`` excludes bets where the price never
+    moved, which are ties and otherwise dilute the hit rate toward 50%.
     """
     s = pd.Series(clv_values).dropna()
     if s.empty:
-        return {"n": 0, "mean": float("nan"), "median": float("nan"), "pct_positive": float("nan")}
+        return {
+            "n": 0, "mean": float("nan"), "median": float("nan"),
+            "pct_positive": float("nan"), "pct_positive_moved": float("nan"),
+            "se": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
+            "significant": False,
+        }
+    mean = float(s.mean())
+    se = float(s.std(ddof=1) / np.sqrt(len(s))) if len(s) > 1 else float("nan")
+    lo, hi = (mean - 1.96 * se, mean + 1.96 * se) if len(s) > 1 else (float("nan"), float("nan"))
+    moved = s[s != 0]
     return {
         "n": int(len(s)),
-        "mean": float(s.mean()),
+        "mean": mean,
         "median": float(s.median()),
         "pct_positive": float((s > 0).mean()),
+        "pct_positive_moved": float((moved > 0).mean()) if len(moved) else float("nan"),
+        "se": se,
+        "ci_low": lo,
+        "ci_high": hi,
+        # Significant only when the whole interval sits on one side of zero.
+        "significant": bool(len(s) > 1 and (lo > 0 or hi < 0)),
     }

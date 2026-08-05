@@ -134,16 +134,27 @@ def build_report(
         if c["n"]:
             add(f"- Measured on **{c['n']:,} of {n_bets:,} bets** "
                 "(closing prices exist from 2019-20 onward)")
-            add(f"- Mean CLV **{_fmt_pct(c['mean'])}**, median {_fmt_pct(c['median'])}")
-            add(f"- Beat the closing price on **{c['pct_positive'] * 100:.1f}%** of bets")
+            add(f"- Mean CLV **{_fmt_pct(c['mean'])}** "
+                f"(SE {c['se'] * 100:.3f}pp, 95% CI "
+                f"[{_fmt_pct(c['ci_low'])}, {_fmt_pct(c['ci_high'])}])")
+            add(f"- Median {_fmt_pct(c['median'])}")
+            add(f"- Beat the closing price on **{c['pct_positive'] * 100:.1f}%** of bets "
+                f"({c['pct_positive_moved'] * 100:.1f}% of the bets where the price moved)")
             add("")
-            if c["mean"] > 0:
-                add("Positive CLV is the leading indicator of a real edge: it resolves on "
-                    "every bet immediately instead of waiting for outcomes to average out.")
+            if not c["significant"]:
+                add("**The interval spans zero: CLV here is indistinguishable from no edge.** "
+                    "CLV is heavily tailed, so a handful of large favourable moves can pull "
+                    "the mean positive while the model sits on the wrong side of the line "
+                    "as often as not — which is what the hit rate shows. A positive mean "
+                    "CLV is only meaningful alongside its interval and a hit rate above 50%.")
+            elif c["mean"] > 0:
+                add("Positive CLV, significant at 95%. This is the leading indicator of a "
+                    "real edge: it resolves on every bet immediately instead of waiting for "
+                    "outcomes to average out.")
             else:
-                add("Negative CLV means the prices taken were systematically worse than "
-                    "the close. Over a long run that is incompatible with a genuine edge, "
-                    "whatever the ROI happens to look like.")
+                add("Negative CLV, significant at 95%. The prices taken were systematically "
+                    "worse than the close. Over a long run that is incompatible with a "
+                    "genuine edge, whatever the ROI happens to look like.")
         else:
             add("No closing prices available in this window.")
     add("")
@@ -169,7 +180,7 @@ def build_report(
     add("")
     if n_bets:
         eq = bets["bankroll_after"]
-        dd = max_drawdown(pd.concat([pd.Series([starting]), eq]))
+        flat = bool(params.get("flat_stake"))
         add("| metric | value |")
         add("|---|---:|")
         add(f"| Bets | {n_bets:,} |")
@@ -177,9 +188,18 @@ def build_report(
         add(f"| P&L | {pnl:+,.0f} |")
         add(f"| ROI | {_fmt_pct(roi)} |")
         add(f"| ROI 95% CI | [{_fmt_pct(lo)}, {_fmt_pct(hi)}] |")
-        add(f"| Starting bankroll | {starting:,.0f} |")
-        add(f"| Final bankroll | {float(eq.iloc[-1]):,.0f} |")
-        add(f"| Max drawdown | {dd * 100:.1f}% |")
+        if flat:
+            # Under flat staking the notional bankroll can go negative, which makes
+            # drawdown-as-a-fraction-of-peak meaningless. Suppress rather than print
+            # a number like "438%" that reads as a real risk figure.
+            add(f"| Flat stake | {params['flat_stake']:,.2f} per bet |")
+            add("| Bankroll / drawdown | n/a — flat staking measures the edge, "
+                "not a bankroll path |")
+        else:
+            dd = max_drawdown(pd.concat([pd.Series([starting]), eq]))
+            add(f"| Starting bankroll | {starting:,.0f} |")
+            add(f"| Final bankroll | {float(eq.iloc[-1]):,.0f} |")
+            add(f"| Max drawdown | {dd * 100:.1f}% |")
         add(f"| Longest losing streak | {longest_losing_streak(bets['result'])} |")
         add(f"| Strike rate | {(bets['result'] == 'W').mean() * 100:.1f}% |")
         add(f"| Average odds taken | {bets['odds_taken'].mean():.2f} |")
@@ -188,7 +208,7 @@ def build_report(
             add(f"| **Halted** | max drawdown breached at {halted_at} |")
         add("")
 
-        if drawdown_breaches:
+        if drawdown_breaches and not flat:
             add(f"### Drawdown pause would have triggered {len(drawdown_breaches)} time(s)")
             add("")
             add("In live use the app stops betting at a 25% drawdown from peak and requires "

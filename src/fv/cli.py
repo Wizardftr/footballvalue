@@ -225,7 +225,10 @@ def backtest(
         predictions=predictions,
         bets=sim.bets,
         equity=sim.equity,
-        params={"starting_bankroll": params.starting_bankroll},
+        params={
+            "starting_bankroll": params.starting_bankroll,
+            "flat_stake": params.flat_stake,
+        },
         diagnostics=diagnostics,
         halted_at=sim.halted_at,
         xi_table=xi_table,
