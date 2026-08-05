@@ -12,7 +12,7 @@ bookmaker scraping and no automated placement of any kind.
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Data pipeline, SQLite schema, Dixon-Coles baseline, walk-forward backtest | **done** |
-| 2 | xG ingestion, xG-blended DC, LightGBM, ensemble, market anchor | not started |
+| 2 | xG ingestion, xG-blended DC, LightGBM, ensemble, market anchor | **done** |
 | 3 | Streamlit dashboard, weekly slip, bet logging, auto-settlement | not started |
 | 4 | The Odds API live prices, CLV tracking, over/under 2.5 and BTTS | not started |
 
@@ -24,6 +24,10 @@ uv run fv init-db        # create the SQLite schema
 uv run fv download       # fetch all eleven leagues, 2000-01 to date (~8 min)
 uv run fv doctor         # data quality checks
 uv run fv backtest       # walk-forward backtest + report in reports/
+
+uv sync --extra model --extra xg     # Phase 2 dependencies
+uv run fv download-xg                # Understat xG for the big-five divisions
+uv run fv stages                     # all five model stages + comparison table
 ```
 
 `fv backtest --help` lists the options. Useful ones:
@@ -60,10 +64,26 @@ CSVs. Four properties of that source shape the code, all confirmed by inspection
 source (E0 2003-04 and 2004-05 are missing ~45 matches each, spread through the
 season); some are legitimate league-size changes (Serie B ran 22 teams until 2018).
 
-**xG** (Phase 2) will come from `soccerdata`, which ships readers for both Understat
-and FBref. The standalone `understat` package is unusable: it pins `pytest==7.2.0`
-and `pytest-cov==4.0.0` as *runtime* dependencies, so it cannot coexist with a test
-suite.
+**xG** comes from Understat, fetched directly. Two things forced that:
+
+- The standalone `understat` package pins `pytest==7.2.0` and `pytest-cov==4.0.0` as
+  *runtime* dependencies, so it cannot coexist with a test suite.
+- `soccerdata`'s Understat reader depends on `tls_requests`, which downloads a native
+  TLS library from GitHub releases at import time. That download is blocked here.
+
+So `fv/data/understat.py` talks to Understat's own JSON endpoint, with local caching
+and a rate limit. **FBref is unavailable** — it returns 403 to datacenter IPs
+regardless of user agent — so the five non-big-five leagues plus Eredivisie run on
+goals only, which is the fallback the spec allows.
+
+Understat team names are resolved by **fixture alignment, not string similarity**.
+Matches are paired on date and scoreline, and the name mapping is derived from which
+pairings agree across a season. This is what correctly produced
+"Wolverhampton Wanderers" → "Wolves" and "Nottingham Forest" → "Nott'm Forest",
+both of which a fuzzy matcher could plausibly get wrong — and a wrong mapping
+silently attaches one club's xG to another. A name that can't be established this
+way is reported, not guessed. All 20,069 matches across five leagues and twelve
+seasons resolved with zero unmatched names.
 
 ## Model (Phase 1)
 
@@ -89,6 +109,31 @@ declined (0.27 over the full history, 0.20 on recent data), and rho has shrunk t
 zero on modern football — the 0-0 excess is still there but 1-1 now comes in *below*
 independent Poisson, so the Dixon-Coles correction as specified does less than it did
 in 1997.
+
+## Model stages (Phase 2)
+
+`fv stages` runs five stages, scores them all on the same held-out matches, and
+writes a comparison. Every weight — decay rate, xG blend, ensemble pool, market
+anchor — is tuned on validation seasons that **end before the test window**. Tuning
+a hyperparameter on the test set is leakage just as much as training on it, and it's
+the easier of the two to do by accident.
+
+1. `dc` — time-decayed Dixon-Coles on goals (the Phase 1 baseline)
+2. `dc_xg` — the same model on a goals/xG blend
+3. `lgbm` — LightGBM on form, Elo, rest days and promotion flags, isotonic-calibrated
+4. `ensemble` — stages 2 and 3 combined by a weighted log-opinion pool
+5. `anchored` — the ensemble blended toward margin-free market probabilities
+
+Feature building is leak-free structurally: the builder walks each league in
+chronological order, writes a match's features from the state accumulated so far,
+then folds that match's result into the state. There is no windowing call that could
+see forward. This matters because a `groupby().rolling()` that includes the current
+row leaks the result being predicted, and the model looks brilliant until it meets
+real money.
+
+LightGBM's best configuration turned out to be startlingly shallow — 4 leaves,
+minimum 300 matches per leaf. With a few thousand training matches and an outcome
+that is mostly noise, a 15-leaf model scored 1.015 where this one scored 0.998.
 
 ## Betting rules
 

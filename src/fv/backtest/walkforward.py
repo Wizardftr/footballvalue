@@ -44,6 +44,7 @@ SELECT
     th.canonical_name AS home,
     ta.canonical_name AS away,
     m.fthg AS fthg, m.ftag AS ftag, m.ftr AS ftr,
+    x.home_xg AS home_xg, x.away_xg AS away_xg,
     MAX(CASE WHEN o.odds_type='pre'     AND o.selection='H' THEN o.decimal_odds END) AS pre_h,
     MAX(CASE WHEN o.odds_type='pre'     AND o.selection='D' THEN o.decimal_odds END) AS pre_d,
     MAX(CASE WHEN o.odds_type='pre'     AND o.selection='A' THEN o.decimal_odds END) AS pre_a,
@@ -53,6 +54,7 @@ SELECT
 FROM matches m
 JOIN teams th ON th.id = m.home_team_id
 JOIN teams ta ON ta.id = m.away_team_id
+LEFT JOIN match_xg x ON x.match_id = m.id
 LEFT JOIN odds o ON o.match_id = m.id AND o.bookmaker = 'B365' AND o.market = '1X2'
 WHERE m.league_code = :league AND m.status = 'played'
 GROUP BY m.id
@@ -95,6 +97,7 @@ def generate_predictions(
     min_train_matches: int = 200,
     max_goals: int = 10,
     keep_fits: bool = False,
+    xg_weight: float = 0.0,
 ) -> PredictionResult:
     """Walk forward week by week, training only on the past.
 
@@ -134,6 +137,9 @@ def generate_predictions(
                 days_before,
                 xi=xi,
                 init=previous,
+                home_xg=train["home_xg"].to_numpy() if "home_xg" in train else None,
+                away_xg=train["away_xg"].to_numpy() if "away_xg" in train else None,
+                xg_weight=xg_weight,
             )
         except ValueError:
             continue
@@ -239,6 +245,50 @@ def tune_xi(
     return best, table
 
 
+def tune_xg_weight(
+    league_code: str,
+    validation_from: str | pd.Timestamp,
+    validation_to: str | pd.Timestamp,
+    grid: list[float],
+    xi: float,
+    cfg: Config | None = None,
+    matches: pd.DataFrame | None = None,
+) -> tuple[float, pd.DataFrame]:
+    """Pick the goals/xG blend weight by walk-forward log loss on validation seasons.
+
+    The spec expects somewhere between 30% and 50% xG. That is a prior, not an
+    answer — this measures it, on the same held-out basis as ``xi``, and a league
+    with no xG coverage will correctly land on 0 because the blend does nothing there.
+    """
+    from fv.backtest.metrics import brier_score, log_loss
+
+    cfg = cfg or load_config()
+    df = matches if matches is not None else load_matches(league_code, cfg)
+
+    rows = []
+    for w in grid:
+        result = generate_predictions(
+            league_code, validation_from, validation_to, xi=xi, cfg=cfg, matches=df, xg_weight=w
+        )
+        preds = result.predictions
+        if preds.empty:
+            continue
+        rows.append(
+            {
+                "xg_weight": w,
+                "n": len(preds),
+                "log_loss": log_loss(preds),
+                "brier": brier_score(preds),
+            }
+        )
+
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return 0.0, table
+    best = float(table.loc[table["log_loss"].idxmin(), "xg_weight"])
+    return best, table
+
+
 # --------------------------------------------------------------------------
 # Betting simulation
 # --------------------------------------------------------------------------
@@ -305,9 +355,15 @@ def find_candidates(predictions: pd.DataFrame, params: BettingParams) -> pd.Data
         fair = remove_margin([float(o) for o in odds_triplet], method=params.margin_method)
         raw = np.array([1.0 / float(o) for o in odds_triplet])
 
+        # A frame without these counts can't tell us whether a team is newly
+        # promoted. Bet it rather than crash, but never silently: the caller sees
+        # the count via SimulationResult.skipped_new_team, which stays at zero here.
+        n_home = getattr(row, "n_home_matches", None)
+        n_away = getattr(row, "n_away_matches", None)
         enough_history = (
-            row.n_home_matches >= params.min_team_matches
-            and row.n_away_matches >= params.min_team_matches
+            True
+            if n_home is None or n_away is None
+            else (n_home >= params.min_team_matches and n_away >= params.min_team_matches)
         )
 
         for i, sel in enumerate(("H", "D", "A")):

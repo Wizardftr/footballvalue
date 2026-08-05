@@ -115,6 +115,8 @@ def _nll_and_gradient(
     hg: np.ndarray,
     ag: np.ndarray,
     weights: np.ndarray,
+    hg_int: np.ndarray | None = None,
+    ag_int: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     """Negative log-likelihood and its analytic gradient.
 
@@ -135,10 +137,15 @@ def _nll_and_gradient(
     lam = np.exp(log_lam)
     mu = np.exp(log_mu)
 
-    m00 = (hg == 0) & (ag == 0)
-    m01 = (hg == 0) & (ag == 1)
-    m10 = (hg == 1) & (ag == 0)
-    m11 = (hg == 1) & (ag == 1)
+    # The low-score correction is defined on actual scorelines. When the Poisson
+    # target is a goals/xG blend it is continuous and would never equal 0 or 1
+    # exactly, so the masks are always taken from the integer result.
+    ihg = hg if hg_int is None else hg_int
+    iag = ag if ag_int is None else ag_int
+    m00 = (ihg == 0) & (iag == 0)
+    m01 = (ihg == 0) & (iag == 1)
+    m10 = (ihg == 1) & (iag == 0)
+    m11 = (ihg == 1) & (iag == 1)
 
     tau = np.ones_like(lam)
     tau[m00] = 1.0 - lam[m00] * mu[m00] * rho
@@ -184,6 +191,33 @@ def _nll_and_gradient(
     grad[2 * n] = d_rho
 
     return nll, grad
+
+
+def blend_targets(
+    goals: np.ndarray,
+    xg: np.ndarray | None,
+    weight: float,
+) -> np.ndarray:
+    """Blend actual goals with xG: ``(1 - weight) * goals + weight * xg``.
+
+    xG strips finishing luck out of team ratings, which is why this is the single
+    highest-value upgrade available on goals-only data. A team that scored four from
+    1.1 xG got lucky, and a rating that takes the four at face value will overrate
+    them until the luck reverses.
+
+    Rows without xG fall back to goals alone rather than being dropped: six of the
+    eleven leagues have no xG source at all, and within the covered five the early
+    seasons are incomplete. Dropping them would silently shrink the training set
+    and bias it toward recent, well-covered matches.
+    """
+    goals = np.asarray(goals, dtype=float)
+    if xg is None or weight <= 0.0:
+        return goals
+    xg = np.asarray(xg, dtype=float)
+    have = np.isfinite(xg)
+    out = goals.copy()
+    out[have] = (1.0 - weight) * goals[have] + weight * xg[have]
+    return out
 
 
 def _trim_stale_teams(
@@ -233,6 +267,9 @@ def fit_dixon_coles(
     init: DixonColesFit | None = None,
     maxiter: int = 500,
     min_effective_matches: float = 1.0,
+    home_xg: np.ndarray | None = None,
+    away_xg: np.ndarray | None = None,
+    xg_weight: float = 0.0,
 ) -> DixonColesFit:
     """Fit the model to a set of completed matches.
 
@@ -240,6 +277,10 @@ def fit_dixon_coles(
     must be >= 0. ``init`` warm-starts from a previous fit, which matters in the
     walk-forward backtest: ratings barely move week to week, so warm-starting cuts
     the optimiser's work substantially.
+
+    Passing ``home_xg``/``away_xg`` with a positive ``xg_weight`` fits the ratings
+    against a goals/xG blend instead of goals alone. Matches without xG keep their
+    goals, so leagues and seasons with no coverage still contribute.
     """
     home_teams = np.asarray(home_teams)
     away_teams = np.asarray(away_teams)
@@ -254,6 +295,13 @@ def fit_dixon_coles(
     away_goals = np.asarray(away_goals)[keep]
     weights = weights_all[keep]
 
+    home_target = blend_targets(
+        home_goals, None if home_xg is None else np.asarray(home_xg)[keep], xg_weight
+    )
+    away_target = blend_targets(
+        away_goals, None if away_xg is None else np.asarray(away_xg)[keep], xg_weight
+    )
+
     teams = sorted(set(home_teams) | set(away_teams))
     n = len(teams)
     if n < 2:
@@ -262,8 +310,10 @@ def fit_dixon_coles(
     idx = {t: i for i, t in enumerate(teams)}
     hi = np.array([idx[t] for t in home_teams], dtype=int)
     ai = np.array([idx[t] for t in away_teams], dtype=int)
-    hg = np.asarray(home_goals, dtype=float)
-    ag = np.asarray(away_goals, dtype=float)
+    hg = np.asarray(home_target, dtype=float)
+    ag = np.asarray(away_target, dtype=float)
+    hg_int = np.asarray(home_goals, dtype=float)
+    ag_int = np.asarray(away_goals, dtype=float)
 
     counts: dict[str, int] = {t: 0 for t in teams}
     for t in home_teams:
@@ -291,7 +341,7 @@ def fit_dixon_coles(
     res = minimize(
         _nll_and_gradient,
         x0,
-        args=(n, hi, ai, hg, ag, weights),
+        args=(n, hi, ai, hg, ag, weights, hg_int, ag_int),
         method="L-BFGS-B",
         jac=True,
         bounds=bounds,

@@ -43,7 +43,9 @@ packages = ["src/fv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# soccerdata pulls in seleniumbase, whose pytest plugin prints a browser banner on
+# every run. We never drive a browser, so switch it off.
+addopts = "-q -p no:seleniumbase"
 
 [tool.ruff]
 line-length = 100

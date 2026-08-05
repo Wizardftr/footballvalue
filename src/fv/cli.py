@@ -48,6 +48,38 @@ def download(
         console.print(f"[red]  {err}[/red]")
 
 
+@app.command("download-xg")
+def download_xg(
+    leagues: str = typer.Option(None, help="Comma-separated league codes."),
+    first_season: str = typer.Option("2014-15", help="Earliest season (Understat starts 2014-15)."),
+    force: bool = typer.Option(False, help="Re-fetch even when cached."),
+):
+    """Download Understat xG for the big-five top divisions.
+
+    The other six leagues have no reliable free xG source and run on goals only.
+    """
+    from fv.data.understat import LEAGUE_SLUGS, download_and_load_xg
+
+    cfg = load_config()
+    _init_db(cfg)
+    codes = [c.strip() for c in leagues.split(",")] if leagues else None
+    console.print(f"[cyan]Understat covers: {', '.join(LEAGUE_SLUGS)}[/cyan]")
+
+    with console.status("fetching") as status:
+        stats = download_and_load_xg(
+            cfg,
+            leagues=codes,
+            first_season=first_season,
+            force=force,
+            progress=lambda c, s: status.update(f"{c} {s}"),
+        )
+
+    console.print(f"[green]{stats.summary()}[/green]")
+    for code, names in stats.unmatched_names.items():
+        console.print(f"[yellow]{code}: {len(names)} team name(s) not resolved by fixture "
+                      f"alignment: {sorted(names)[:8]}[/yellow]")
+
+
 @app.command()
 def doctor():
     """Data quality checks. Surfaces gaps rather than letting them pass silently."""
@@ -238,6 +270,42 @@ def backtest(
     out_dir = out or (PROJECT_ROOT / "reports")
     path = write_report(out_dir, report, predictions, sim.bets, sim.equity)
     console.print(f"\n[green]report written to {path}[/green]\n")
+    console.print(report)
+
+
+@app.command()
+def stages(
+    leagues: str = typer.Option(None, help="Comma-separated league codes."),
+    valid_from: str = typer.Option("2019-08-01", help="Start of the validation window."),
+    test_from: str = typer.Option("2022-08-01", help="Start of the test window."),
+    test_to: str = typer.Option(None, help="End of the test window."),
+    flat_stake: float = typer.Option(10.0, help="Flat stake for the betting comparison."),
+    out: Path = typer.Option(None, help="Report directory (default: reports/stages)."),
+):
+    """Run all five model stages and produce the stage-by-stage comparison.
+
+    Every weight is tuned on the validation window, which ends before the test
+    window begins, so no stage sees test data while being configured.
+    """
+    from fv.backtest.stage_runner import run_stages
+
+    cfg = load_config()
+    codes = (
+        [c.strip() for c in leagues.split(",")]
+        if leagues
+        else [lg.code for lg in cfg.enabled_leagues]
+    )
+    out_dir = out or (PROJECT_ROOT / "reports" / "stages")
+    report = run_stages(
+        cfg,
+        codes,
+        valid_from=valid_from,
+        test_from=test_from,
+        test_to=test_to,
+        flat_stake=flat_stake,
+        out_dir=out_dir,
+        console=console,
+    )
     console.print(report)
 
 
