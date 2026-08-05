@@ -258,7 +258,16 @@ class BettingParams:
     max_bets_per_week: int = 8
     min_team_matches: int = 6
     margin_method: str = "proportional"
-    weekly_stop_loss_pct: float = 0.10
+    # Flat staking evaluates the edge itself, decoupled from the staking plan.
+    # With Kelly, a bad early run shrinks the bankroll until stakes round below the
+    # minimum and betting stops, so the measured ROI reflects a compounding path
+    # rather than the model, and later seasons never get evaluated at all. Set a
+    # flat stake to keep every season in the sample.
+    flat_stake: float | None = None
+    # None disables the weekly stop-loss. Used with flat staking to measure the raw
+    # edge over the whole window; a stop-loss keyed to a shrinking bankroll would
+    # otherwise truncate the sample for a second time.
+    weekly_stop_loss_pct: float | None = 0.10
     max_drawdown_pct: float = 0.25
     # In live use the drawdown pause stops betting until it is manually reset. In a
     # backtest that would end the evaluation at the first bad run and hide
@@ -371,12 +380,18 @@ def simulate_betting(
 
         week_loss = 0.0
         for row in chosen.itertuples(index=False):
-            stake = stake_for(row.model_prob, row.odds_taken, bankroll, params.stake_rules)
+            if params.flat_stake is not None:
+                stake = params.flat_stake
+            else:
+                stake = stake_for(row.model_prob, row.odds_taken, bankroll, params.stake_rules)
             if stake <= 0:
                 continue
 
             # Weekly stop-loss: stop taking new bets once the week is far enough down.
-            if week_loss >= params.weekly_stop_loss_pct * week_start_bankroll:
+            if (
+                params.weekly_stop_loss_pct is not None
+                and week_loss >= params.weekly_stop_loss_pct * week_start_bankroll
+            ):
                 break
 
             won = row.ftr == row.selection

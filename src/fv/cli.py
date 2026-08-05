@@ -123,6 +123,11 @@ def backtest(
     out: Path = typer.Option(None, help="Report directory (default: reports/)."),
     bankroll: float = typer.Option(None, help="Starting bankroll."),
     min_edge: float = typer.Option(None, help="Minimum edge to bet."),
+    flat_stake: float = typer.Option(
+        None,
+        help="Bet a fixed amount instead of Kelly. Measures the edge itself without "
+        "the compounding path, and keeps late seasons in the sample.",
+    ),
 ):
     """Run the walk-forward backtest and write a report."""
     from fv.backtest.report import build_report, write_report
@@ -205,8 +210,11 @@ def backtest(
         max_bets_per_week=betting.get("max_bets_per_week", 8),
         min_team_matches=cfg.dixon_coles.get("min_team_matches", 6),
         margin_method=cfg.odds.get("margin_method", "proportional"),
-        weekly_stop_loss_pct=risk.get("weekly_stop_loss_pct", 0.10),
+        # Flat staking is an evaluation mode: risk controls keyed to a shrinking
+        # bankroll would truncate the sample, which is exactly what it exists to avoid.
+        weekly_stop_loss_pct=None if flat_stake else risk.get("weekly_stop_loss_pct", 0.10),
         max_drawdown_pct=risk.get("max_drawdown_pct", 0.25),
+        flat_stake=flat_stake,
     )
 
     console.print(f"[cyan]simulating {len(predictions):,} predictions[/cyan]")

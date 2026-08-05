@@ -249,11 +249,19 @@ def build_report(
         add("Chosen on validation seasons that end before the test window starts, so the "
             "hyperparameter never sees test data.")
         add("")
-        add("| xi | half-life (days) | matches | log loss | Brier |")
-        add("|---:|---:|---:|---:|---:|")
-        for r in xi_table.itertuples(index=False):
-            hl = "inf" if not np.isfinite(r.half_life_days) else f"{r.half_life_days:.0f}"
-            add(f"| {r.xi:g} | {hl} | {r.n:,} | {r.log_loss:.4f} | {r.brier:.4f} |")
+        add("The chosen row per league is marked with an arrow.")
+        add("")
+        add("| league | xi | half-life (days) | matches | log loss | Brier | |")
+        add("|---|---:|---:|---:|---:|---:|---|")
+        has_league = "league_code" in xi_table.columns
+        groups = xi_table.groupby("league_code") if has_league else [("", xi_table)]
+        for code, g in groups:
+            best_idx = g["log_loss"].idxmin()
+            for r in g.itertuples(index=True):
+                hl = "inf" if not np.isfinite(r.half_life_days) else f"{r.half_life_days:.0f}"
+                mark = " <-- chosen" if r.Index == best_idx else ""
+                add(f"| {code} | {r.xi:g} | {hl} | {r.n:,} | {r.log_loss:.4f} "
+                    f"| {r.brier:.4f} |{mark} |")
         add("")
 
     # ---------------------------------------------------------------- diagnostics
