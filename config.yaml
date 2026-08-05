@@ -1,0 +1,125 @@
+# footballvalue configuration.
+# Everything here is a default; the Settings page (Phase 3) writes overrides into
+# the `settings` table, which take precedence at runtime.
+
+data:
+  db_path: data/footballvalue.db
+  raw_cache: data/raw
+  # First season to download. bet365 odds only exist from 2002-03, but earlier
+  # seasons still give the ratings something to warm up on.
+  first_season: "2000-01"
+  # football-data.co.uk publishes a season file only once the season starts.
+  # Missing files are skipped, not treated as an error.
+  base_url: https://www.football-data.co.uk/mmz4281
+
+# Leagues in priority order. `enabled: false` removes a league everywhere:
+# download, model fitting, backtest, and slip generation.
+leagues:
+  - code: E0
+    name: Premier League
+    country: England
+    tier: 1
+    enabled: true
+    has_xg: true          # understat covers the big-five top divisions
+  - code: E1
+    name: Championship
+    country: England
+    tier: 2
+    enabled: true
+    has_xg: false         # FBref via soccerdata, Phase 2
+  - code: SP1
+    name: La Liga
+    country: Spain
+    tier: 1
+    enabled: true
+    has_xg: true
+  - code: SP2
+    name: Segunda Division
+    country: Spain
+    tier: 2
+    enabled: true
+    has_xg: false
+  - code: I1
+    name: Serie A
+    country: Italy
+    tier: 1
+    enabled: true
+    has_xg: true
+  - code: I2
+    name: Serie B
+    country: Italy
+    tier: 2
+    enabled: true
+    has_xg: false
+  - code: D1
+    name: Bundesliga
+    country: Germany
+    tier: 1
+    enabled: true
+    has_xg: true
+  - code: D2
+    name: 2. Bundesliga
+    country: Germany
+    tier: 2
+    enabled: true
+    has_xg: false
+  - code: F1
+    name: Ligue 1
+    country: France
+    tier: 1
+    enabled: true
+    has_xg: true
+  - code: F2
+    name: Ligue 2
+    country: France
+    tier: 2
+    enabled: true
+    has_xg: false
+  - code: N1
+    name: Eredivisie
+    country: Netherlands
+    tier: 1
+    enabled: true
+    has_xg: false
+
+model:
+  dixon_coles:
+    # Time-decay rate per day. `null` means tune it on validation seasons
+    # rather than trusting a hardcoded guess.
+    xi: null
+    xi_grid: [0.0, 0.0005, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.006]
+    max_goals: 10
+    # Don't bet a match where either team has fewer than this many matches of
+    # history in the training window (newly promoted sides have no rating).
+    # They are still predicted, just excluded from the slip.
+    min_team_matches: 6
+    # Refit cadence in match-weeks. 1 = refit every week (slowest, most correct).
+    refit_every_weeks: 1
+
+odds:
+  # Bookmaker margin removal: "proportional" or "shin".
+  margin_method: proportional
+  bookmaker: B365
+
+betting:
+  starting_bankroll: 1000.0
+  min_edge: 0.04
+  min_odds: 1.50
+  max_odds: 4.00
+  kelly_fraction: 0.25
+  max_stake_pct: 0.02        # of current bankroll, per bet
+  max_bets_per_week: 8
+  stake_rounding: 0.50
+  min_stake: 1.00
+
+risk:
+  weekly_stop_loss_pct: 0.10   # stop betting for the week after losing this much
+  max_drawdown_pct: 0.25       # pause and require manual reset
+  paper_mode: true             # real money is a deliberate, manual switch
+
+backtest:
+  # Default evaluation window. bet365 prices start 2002-03; closing prices
+  # (and therefore CLV) start 2019-20.
+  train_from: "2000-01"
+  test_from: "2010-11"
+  test_to: null                # null = latest available

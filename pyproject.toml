@@ -1,0 +1,50 @@
+[project]
+name = "footballvalue"
+version = "0.1.0"
+description = "Personal football betting analysis: model match outcomes, find value vs bet365, track bankroll."
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "requests>=2.32",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "rapidfuzz>=3.9",
+]
+
+[project.optional-dependencies]
+# Phase 2 model stack
+model = ["scikit-learn>=1.5", "lightgbm>=4.3"]
+# Phase 2 xG ingestion.
+# NOTE: the standalone `understat` package pins pytest==7.2.0 and pytest-cov==4.0.0
+# as *runtime* dependencies, so it cannot coexist with a modern test suite. We use
+# soccerdata instead, which ships its own Understat reader alongside FBref and so
+# covers both the big-five xG source and the secondary leagues with one dependency.
+xg = ["soccerdata>=1.8"]
+# Phase 3 dashboard
+ui = ["streamlit>=1.36", "altair>=5.3"]
+
+[dependency-groups]
+dev = ["pytest>=8.2", "ruff>=0.5"]
+
+[project.scripts]
+fv = "fv.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
