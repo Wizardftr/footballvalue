@@ -26,7 +26,15 @@ model = ["scikit-learn>=1.5", "lightgbm>=4.3"]
 # covers both the big-five xG source and the secondary leagues with one dependency.
 xg = ["soccerdata>=1.8"]
 # Phase 3 dashboard
-ui = ["streamlit>=1.36", "altair>=5.3"]
+ui = [
+    "streamlit>=1.36",
+    "altair>=5.3",
+    # Streamlit 1.61's gzip middleware subclasses starlette's GZipResponder, and
+    # starlette 1.4 added a required `thread_minimum_size` argument to it. With 1.4
+    # installed, every request to the dashboard returns HTTP 500 and the page renders
+    # blank. Pin until Streamlit catches up.
+    "starlette<1.4",
+]
 
 [dependency-groups]
 dev = ["pytest>=8.2", "ruff>=0.5"]

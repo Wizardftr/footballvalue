@@ -309,5 +309,86 @@ def stages(
     console.print(report)
 
 
+@app.command()
+def fixtures():
+    """Download upcoming fixtures and their bet365 prices."""
+    from fv.data.fixtures import download_fixtures
+
+    cfg = load_config()
+    _init_db(cfg)
+    stats = download_fixtures(cfg)
+    console.print(f"[green]{stats.summary()}[/green]")
+    if stats.in_scope == 0:
+        console.print("[yellow]No fixtures for enabled leagues. football-data publishes "
+                      "about a week ahead and only once a season is under way.[/yellow]")
+    for name in stats.unresolved[:10]:
+        console.print(f"[red]unresolved team name: {name}[/red]")
+
+
+@app.command()
+def slip(
+    bankroll: float = typer.Option(None, help="Override the ledger bankroll."),
+    log: bool = typer.Option(False, "--log", help="Record the slip as pending bets."),
+    real: bool = typer.Option(False, "--real", help="Log as real money instead of paper."),
+    out: Path = typer.Option(None, help="Write the slip to a file."),
+):
+    """Generate this week's recommended slip."""
+    from fv.bets import current_bankroll, log_slip
+    from fv.slip import generate_slip, slip_to_csv, slip_to_text
+
+    cfg = load_config()
+    br = bankroll if bankroll is not None else current_bankroll(cfg)
+    result = generate_slip(cfg, bankroll=br)
+    text_slip = slip_to_text(result)
+    console.print(text_slip)
+
+    if result.untuned_leagues:
+        console.print(f"[yellow]No tuned weights for {', '.join(result.untuned_leagues)}; "
+                      "using config defaults. Run `fv stages` first.[/yellow]")
+
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text_slip)
+        out.with_suffix(".csv").write_text(slip_to_csv(result))
+        console.print(f"[green]written to {out} and {out.with_suffix('.csv')}[/green]")
+
+    if log and not result.selections.empty:
+        if real:
+            from fv.settings_store import real_money_readiness
+
+            r = real_money_readiness(cfg)
+            if not r.ready:
+                console.print(f"[red]{r.headline}[/red]")
+                for reason in r.reasons:
+                    console.print(f"[red]  - {reason}[/red]")
+                if not typer.confirm("Log these as REAL MONEY anyway?"):
+                    raise typer.Abort()
+        slip_id, n = log_slip(result.selections, mode="real" if real else "paper", cfg=cfg)
+        console.print(f"[green]logged {n} bets as {slip_id}[/green]")
+
+
+@app.command()
+def settle():
+    """Auto-settle pending bets whose results have arrived."""
+    from fv.bets import settle_pending
+
+    stats = settle_pending(load_config())
+    console.print(f"[green]{stats.summary()}[/green]")
+
+
+@app.command()
+def dashboard(port: int = typer.Option(8501, help="Port to serve on.")):
+    """Launch the Streamlit dashboard."""
+    import subprocess
+    import sys
+
+    app_path = Path(__file__).parent / "app" / "dashboard.py"
+    subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", str(app_path),
+         "--server.port", str(port), "--server.headless", "true"],
+        check=False,
+    )
+
+
 if __name__ == "__main__":
     app()

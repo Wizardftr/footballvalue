@@ -13,7 +13,7 @@ bookmaker scraping and no automated placement of any kind.
 |---|---|---|
 | 1 | Data pipeline, SQLite schema, Dixon-Coles baseline, walk-forward backtest | **done** |
 | 2 | xG ingestion, xG-blended DC, LightGBM, ensemble, market anchor | **done** |
-| 3 | Streamlit dashboard, weekly slip, bet logging, auto-settlement | not started |
+| 3 | Streamlit dashboard, weekly slip, bet logging, auto-settlement | **done** |
 | 4 | The Odds API live prices, CLV tracking, over/under 2.5 and BTTS | not started |
 
 ## Quick start
@@ -28,6 +28,20 @@ uv run fv backtest       # walk-forward backtest + report in reports/
 uv sync --extra model --extra xg     # Phase 2 dependencies
 uv run fv download-xg                # Understat xG for the big-five divisions
 uv run fv stages                     # all five model stages + comparison table
+
+uv run fv fixtures                   # upcoming fixtures + bet365 prices
+uv run fv slip --log                 # this week's slip, logged as paper bets
+uv run fv settle                     # auto-settle bets whose results have arrived
+uv run fv dashboard                  # Streamlit UI on localhost:8501
+```
+
+### Weekly routine
+
+```bash
+uv run fv download && uv run fv download-xg   # new results
+uv run fv settle                              # settle last week's bets
+uv run fv fixtures                            # this week's fixtures and prices
+uv run fv slip --log                          # generate and log the slip
 ```
 
 `fv backtest --help` lists the options. Useful ones:
@@ -196,6 +210,37 @@ src/fv/
   backtest/               walkforward, metrics, report
 tests/
 ```
+
+## The dashboard
+
+`uv run fv dashboard`. Four pages:
+
+- **This Week** — fixtures, model vs bet365, edge per selection, the recommended slip
+  with stakes, and text/CSV export for placing by hand. It also lists every selection
+  that *didn't* qualify with the reason, so "why is this not on the slip?" is
+  answerable.
+- **Backtest** — stage comparison, cumulative P&L, drawdown, ROI by league and season,
+  CLV distribution with its confidence interval.
+- **Bankroll** — balance, full bet log, paper vs real split, rolling 300-bet ROI *with
+  its confidence band*, monthly P&L labelled as variance, longest losing streak.
+- **Settings** — bankroll, Kelly fraction, edge threshold, odds range, league toggles,
+  stop-loss levels, and the paper/real toggle.
+
+### The real-money gate
+
+Paper mode is on by default and real money is *earned*, not assumed. The Settings
+page computes the verdict from stored results rather than from anyone's
+recollection, and shows it beside the toggle:
+
+1. the model must beat bet365's closing prices out-of-sample in `fv stages`, and
+2. paper trading must have run at least 4 weeks with CLV significantly above zero.
+
+An absent backtest counts as a failure, not an unknown — a gate you can pass by not
+running the test is not a gate. **As of the Phase 2 results the gate correctly
+refuses**: the model is 0.34 millinats behind bet365, and no paper trading has run.
+
+Both `fv slip --real` and the dashboard toggle still let you override it. They just
+make you look at the evidence first.
 
 ## Ground rules
 
