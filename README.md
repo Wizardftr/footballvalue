@@ -7,7 +7,7 @@ bets, and tracks bankroll performance.
 **It never places bets.** It produces a slip you place manually. There is no
 bookmaker scraping and no automated placement of any kind.
 
-## Status: Phase 1
+## Status: Phases 1-3 complete
 
 | Phase | Scope | State |
 |---|---|---|
