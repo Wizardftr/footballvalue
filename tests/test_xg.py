@@ -225,3 +225,31 @@ def test_low_score_correction_still_uses_integer_goals():
     # rho is only identifiable if the masks fired on real scorelines.
     assert fit.rho != 0.0
     assert fit.converged
+
+
+# -- wrong-league file guard (lives here for want of a data-quality test file) --
+
+def test_a_file_containing_another_league_is_rejected():
+    """football-data actually served Scottish Division 1 data at the La Liga URL for
+    the unstarted 2026-27 season. Trusting the URL silently created ten Scottish
+    clubs as Spanish teams. The file's own Div column is authoritative."""
+    from fv.data.football_data import WrongLeagueError, parse_csv
+
+    payload = (
+        b"\xef\xbb\xbfDiv,Date,Time,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n"
+        b"SC1,01/08/2026,15:00,Ayr,Arbroath,2,0,H\n"
+    )
+    with pytest.raises(WrongLeagueError, match="SC1"):
+        parse_csv(payload, "SP1", "2026-27")
+
+
+def test_the_right_league_passes_the_guard_including_with_a_bom():
+    from fv.data.football_data import parse_csv
+
+    payload = (
+        b"\xef\xbb\xbfDiv,Date,Time,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n"
+        b"SP1,16/08/2026,20:00,Barcelona,Sevilla,2,0,H\n"
+    )
+    df = parse_csv(payload, "SP1", "2026-27")
+    assert len(df) == 1
+    assert df.iloc[0]["home"] == "Barcelona"
