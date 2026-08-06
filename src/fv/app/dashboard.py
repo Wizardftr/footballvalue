@@ -241,6 +241,16 @@ def page_backtest():
         st.dataframe(by_season, hide_index=True, use_container_width=True,
                      column_config={"roi": st.column_config.NumberColumn(format="%.2f%%")})
 
+    markets_dir = PROJECT_ROOT / "reports" / "markets"
+    if (markets_dir / "markets_report.md").exists():
+        st.subheader("Other markets")
+        st.caption("Over/under 2.5 has real bet365 prices and a real backtest. "
+                   "**BTTS has no historical prices anywhere free, so it is not "
+                   "validated** — the model produces a probability, but nothing "
+                   "measures whether it beats a price.")
+        with st.expander("Over/under 2.5 and BTTS report"):
+            st.markdown((markets_dir / "markets_report.md").read_text())
+
     st.subheader("CLV distribution")
     clv = bets["clv"].dropna()
     if clv.empty:

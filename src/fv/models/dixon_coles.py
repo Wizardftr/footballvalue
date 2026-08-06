@@ -94,6 +94,23 @@ class DixonColesFit:
         total = p_home + p_draw + p_away
         return p_home / total, p_draw / total, p_away / total
 
+    def prob_over(self, home: str, away: str, line: float = 2.5, max_goals: int = 10) -> float:
+        """P(total goals > line), from the same fitted score matrix.
+
+        No separate model is needed: 1X2, over/under and BTTS are three different
+        aggregations of one joint distribution over scorelines. That consistency is
+        a feature — the markets can never contradict each other, which they could if
+        each were modelled independently.
+        """
+        m = self.score_matrix(home, away, max_goals)
+        totals = np.add.outer(np.arange(max_goals + 1), np.arange(max_goals + 1))
+        return float(m[totals > line].sum())
+
+    def prob_btts(self, home: str, away: str, max_goals: int = 10) -> float:
+        """P(both teams score) — both scorelines at least 1."""
+        m = self.score_matrix(home, away, max_goals)
+        return float(m[1:, 1:].sum())
+
     def knows(self, team: str, min_matches: int = 0) -> bool:
         return team in self.index and self.n_matches.get(team, 0) >= min_matches
 

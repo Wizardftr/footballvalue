@@ -7,14 +7,14 @@ bets, and tracks bankroll performance.
 **It never places bets.** It produces a slip you place manually. There is no
 bookmaker scraping and no automated placement of any kind.
 
-## Status: Phases 1-3 complete
+## Status: Phases 1-4 complete
 
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Data pipeline, SQLite schema, Dixon-Coles baseline, walk-forward backtest | **done** |
 | 2 | xG ingestion, xG-blended DC, LightGBM, ensemble, market anchor | **done** |
 | 3 | Streamlit dashboard, weekly slip, bet logging, auto-settlement | **done** |
-| 4 | The Odds API live prices, CLV tracking, over/under 2.5 and BTTS | not started |
+| 4 | The Odds API live prices, CLV tracking, over/under 2.5 and BTTS | **done** |
 
 ## Quick start
 
@@ -33,16 +33,23 @@ uv run fv fixtures                   # upcoming fixtures + bet365 prices
 uv run fv slip --log                 # this week's slip, logged as paper bets
 uv run fv settle                     # auto-settle bets whose results have arrived
 uv run fv dashboard                  # Streamlit UI on localhost:8501
+
+uv run fv markets                    # over/under 2.5 backtest + BTTS calibration
+uv run fv live-odds                  # The Odds API snapshots (needs ODDS_API_KEY)
+uv run fv refresh                    # the whole weekly routine in one command
 ```
 
 ### Weekly routine
 
+One command does all of it:
+
 ```bash
-uv run fv download && uv run fv download-xg   # new results
-uv run fv settle                              # settle last week's bets
-uv run fv fixtures                            # this week's fixtures and prices
-uv run fv slip --log                          # generate and log the slip
+uv run fv refresh --log-slip
 ```
+
+That downloads new results and xG, promotes snapshots that are now closing prices,
+backfills CLV, settles last week's bets, refreshes fixtures and live prices, and
+generates the slip.
 
 `fv backtest --help` lists the options. Useful ones:
 
@@ -241,6 +248,69 @@ refuses**: the model is 0.34 millinats behind bet365, and no paper trading has r
 
 Both `fv slip --real` and the dashboard toggle still let you override it. They just
 make you look at the evidence first.
+
+## Markets
+
+**1X2** is the v1 market and the one with the most evidence behind it.
+
+**Over/under 2.5** is fully backtested. bet365 published these prices in
+football-data from 2019-20, pre and closing, so it gets the same treatment as 1X2 —
+walk-forward predictions, real prices, real CLV. It was worth testing on the theory
+that it might be softer than 1X2. **It isn't** — see the results section.
+
+**BTTS is not validated.** There are no historical BTTS prices in football-data or
+any other free source this project can reach, so there is no edge, ROI or CLV to
+compute and no backtest is possible. The model produces a BTTS probability and its
+calibration is checked, but under the project's own rule — an upgrade ships only if
+it beats the previous stage out-of-sample — BTTS must not be bet on. Prices only
+begin accumulating once The Odds API snapshots start. The calibration check also
+found a real problem: the model **under-predicts BTTS by about 1.9 percentage
+points**, which would bias it toward backing "No".
+
+All three come from the same fitted Dixon-Coles score matrix rather than separate
+models — they are different aggregations of one joint distribution over scorelines,
+so they can never contradict each other.
+
+## The Odds API (Phase 4)
+
+Used for what football-data cannot provide: BTTS prices, and repeated snapshots near
+kickoff so CLV can be measured on bets actually placed.
+
+Put a key in `.env` (never committed). Without one, `fv refresh` skips the live-price
+step and carries on — football-data still covers 1X2 and over/under 2.5.
+
+Quota is the binding constraint: the free tier allows 500 requests a month and one
+request costs `regions x markets` credits, not one. So markets are requested together
+in a single call per league, responses are cached, and the remaining quota is read
+back from the response headers and reported.
+
+Closing prices are **derived** from snapshots rather than trusted from any single
+fetch. Only a snapshot taken within 12 hours of kickoff is promoted to a closing
+price. A price captured four days out is not the close, and treating it as one would
+inflate CLV — the metric the whole project rests on.
+
+## Results
+
+Every stage and market, measured against bet365's own margin-free prices on held-out
+matches:
+
+| market / stage | model log loss | bet365 | verdict |
+|---|---:|---:|---|
+| 1X2 — Dixon-Coles (goals) | 1.02326 | 1.00255 | behind |
+| 1X2 — + xG blend | 1.02149 | 1.00255 | behind |
+| 1X2 — + LightGBM ensemble | 1.02091 | 1.00255 | behind |
+| 1X2 — market-anchored | 1.00289 | 1.00255 | **behind by 0.34 millinats** |
+| Over/under 2.5 | 0.68482 | 0.67418 | behind by 10.6 millinats |
+| BTTS | 0.69061 | — | **no prices exist; unvalidated** |
+
+**Nothing beats the market.** ROI is negative on both tradeable markets (1X2 -8.1%,
+over/under -6.8%) and CLV is statistically indistinguishable from zero on both. The
+dashboard says so, and the real-money gate refuses on that basis.
+
+The most telling number is in the tuned weights: **eight of eleven leagues tuned the
+market anchor to 1.0**, meaning validation's own verdict was to ignore the model
+entirely and use the price. That is what a genuine absence of edge looks like when
+you measure it honestly instead of hoping.
 
 ## Ground rules
 

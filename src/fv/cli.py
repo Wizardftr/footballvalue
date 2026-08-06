@@ -390,5 +390,120 @@ def dashboard(port: int = typer.Option(8501, help="Port to serve on.")):
     )
 
 
+@app.command("live-odds")
+def live_odds(
+    leagues: str = typer.Option(None, help="Comma-separated league codes."),
+    force: bool = typer.Option(False, help="Ignore the cache and re-fetch."),
+):
+    """Fetch current prices from The Odds API and store them as snapshots."""
+    from fv.data.live_odds import store_snapshots
+    from fv.data.odds_api import MissingApiKey
+
+    cfg = load_config()
+    if not cfg.odds_api_key:
+        console.print("[yellow]ODDS_API_KEY is not set.[/yellow] Copy .env.example to .env "
+                      "and add a key from https://the-odds-api.com (the free tier is enough "
+                      "for weekly use). Until then football-data prices are used, which cover "
+                      "1X2 and over/under 2.5 but not BTTS.")
+        raise typer.Exit(1)
+
+    codes = [c.strip() for c in leagues.split(",")] if leagues else None
+    try:
+        stats = store_snapshots(cfg, leagues=codes, force=force)
+    except MissingApiKey as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    console.print(f"[green]{stats.summary()}[/green]")
+    if stats.unresolved_names:
+        console.print(f"[yellow]{len(stats.unresolved_names)} team name(s) unresolved: "
+                      f"{sorted(stats.unresolved_names)[:8]}[/yellow]")
+    for e in stats.unmatched_events[:5]:
+        console.print(f"[yellow]  no fixture matched: {e}[/yellow]")
+
+
+@app.command()
+def refresh(
+    skip_download: bool = typer.Option(False, help="Skip the results download."),
+    skip_xg: bool = typer.Option(False, help="Skip the xG download."),
+    log_slip: bool = typer.Option(False, "--log-slip", help="Log the generated slip."),
+):
+    """The weekly routine, in one command.
+
+    Downloads new results, settles last week's bets, refreshes fixtures and prices,
+    promotes closing odds from snapshots, backfills CLV, and generates the slip.
+    """
+    from fv.bets import current_bankroll, log_slip as do_log_slip, settle_pending
+    from fv.data.fixtures import download_fixtures
+    from fv.data.live_odds import backfill_clv, promote_closing_odds, store_snapshots
+    from fv.slip import generate_slip, slip_to_text
+
+    cfg = load_config()
+    _init_db(cfg)
+    step = 0
+
+    def heading(text: str):
+        nonlocal step
+        step += 1
+        console.rule(f"[bold cyan]{step}. {text}")
+
+    if not skip_download:
+        heading("New results")
+        from fv.data.load import download_and_load
+        console.print(download_and_load(cfg, first_season="2024-25").summary())
+
+    if not skip_xg:
+        heading("xG")
+        from fv.data.understat import download_and_load_xg
+        console.print(download_and_load_xg(cfg, first_season="2024-25").summary())
+
+    heading("Closing prices and CLV")
+    # Snapshots become closing prices once their match has kicked off.
+    console.print(promote_closing_odds(cfg).summary())
+    filled = backfill_clv(cfg)
+    console.print(f"CLV backfilled on {filled} settled bets")
+
+    heading("Settle last week")
+    console.print(settle_pending(cfg).summary())
+
+    heading("Upcoming fixtures")
+    console.print(download_fixtures(cfg).summary())
+
+    if cfg.odds_api_key:
+        heading("Live prices")
+        try:
+            console.print(store_snapshots(cfg).summary())
+        except Exception as exc:
+            console.print(f"[yellow]live odds unavailable: {exc}[/yellow]")
+    else:
+        console.print("[dim]ODDS_API_KEY not set - skipping live prices "
+                      "(football-data prices still cover 1X2 and over/under 2.5)[/dim]")
+
+    heading("This week's slip")
+    result = generate_slip(cfg, bankroll=current_bankroll(cfg))
+    console.print(slip_to_text(result))
+    if log_slip and not result.selections.empty:
+        slip_id, n = do_log_slip(result.selections, mode="paper", cfg=cfg)
+        console.print(f"[green]logged {n} bets as {slip_id}[/green]")
+
+
+@app.command()
+def markets(
+    leagues: str = typer.Option(None, help="Comma-separated league codes."),
+    test_from: str = typer.Option("2022-08-01", help="Start of the test window."),
+    out: Path = typer.Option(None, help="Report directory (default: reports/markets)."),
+):
+    """Backtest over/under 2.5 and check BTTS calibration."""
+    from fv.backtest.market_report import run_market_backtest
+
+    cfg = load_config()
+    codes = ([c.strip() for c in leagues.split(",")] if leagues
+             else [lg.code for lg in cfg.enabled_leagues])
+    report = run_market_backtest(cfg, codes, test_from=test_from,
+                                 out_dir=out or (PROJECT_ROOT / "reports" / "markets"),
+                                 console=console)
+    console.print(report)
+
+
 if __name__ == "__main__":
     app()
