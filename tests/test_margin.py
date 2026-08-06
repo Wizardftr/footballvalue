@@ -96,3 +96,48 @@ def test_rejects_invalid_odds():
 def test_rejects_unknown_method():
     with pytest.raises(ValueError, match="unknown margin method"):
         remove_margin([2.0, 4.0, 4.0], method="magic")
+
+
+# -- wrong-league guard -----------------------------------------------------
+# Kept here alongside the other data-integrity checks: football-data served
+# Scottish Division 1 and 2 files at the La Liga and Segunda URLs for the unstarted
+# 2026-27 season, which loaded ten Scottish clubs as Spanish teams. Trusting the URL
+# over the file's own Div column is silent cross-country corruption.
+
+def test_parse_rejects_a_file_from_a_different_league():
+    import pytest as _pytest
+
+    from fv.data.football_data import WrongLeagueError, parse_csv
+
+    payload = (
+        b"Div,Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n"
+        b"SC1,01/08/2026,Ayr,Arbroath,2,0,H\n"
+    )
+    with _pytest.raises(WrongLeagueError, match="SC1"):
+        parse_csv(payload, "SP1", "2026-27")
+
+
+def test_parse_accepts_a_file_whose_div_matches():
+    from fv.data.football_data import parse_csv
+
+    payload = (
+        b"Div,Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n"
+        b"SP1,17/08/2026,Barcelona,Sevilla,3,1,H\n"
+    )
+    out = parse_csv(payload, "SP1", "2026-27")
+    assert len(out) == 1
+    assert out.iloc[0]["home"] == "Barcelona"
+
+
+def test_parse_handles_the_utf8_bom_on_the_div_column():
+    """These files carry a BOM, which under latin-1 renames Div and hides it from
+    the guard entirely — the bug that let the wrong-league file through."""
+    from fv.data.football_data import WrongLeagueError, parse_csv
+    import pytest as _pytest
+
+    payload = (
+        "﻿Div,Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR\n"
+        "SC2,01/08/2026,Morton,Partick,0,1,A\n"
+    ).encode("utf-8")
+    with _pytest.raises(WrongLeagueError):
+        parse_csv(payload, "SP2", "2026-27")
