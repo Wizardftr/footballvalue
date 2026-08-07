@@ -176,3 +176,39 @@ def test_combine_keeps_only_matches_present_in_both():
 
 def test_combine_on_empty_input():
     assert combine(pd.DataFrame(), _frame([0.5, 0.3, 0.2], "H", n=2), 0.5).empty
+
+
+# -- the fully-anchored league ----------------------------------------------
+# Found live, on the first real slip: eight of eleven leagues tuned their market
+# anchor to 1.0, and all three leagues with fixtures that weekend were among them.
+# At weight 1.0 the anchored probability IS the market's margin-free probability,
+# so every edge equals minus the bookmaker's margin and no bet can ever qualify.
+# That is arithmetic, not variance, and the slip has to say so.
+
+def test_full_market_weight_makes_every_edge_exactly_minus_the_margin():
+    from fv.odds.edge import edge
+    from fv.odds.margin import remove_margin
+
+    odds = [2.10, 3.40, 3.80]
+    f = _frame([0.70, 0.20, 0.10], "H", prices=tuple(odds), n=1)
+    anchored = anchor_to_market(f, market_weight=1.0)
+
+    fair = remove_margin(odds)
+    booksum = sum(1.0 / o for o in odds)
+    for i, (col, o) in enumerate(zip(["p_home", "p_draw", "p_away"], odds, strict=True)):
+        assert anchored[col].iloc[0] == pytest.approx(fair[i])
+        # fair_i * o == (1/o / booksum) * o == 1 / booksum, so every edge is identical
+        # and equal to 1/booksum - 1: strictly negative whenever the book has margin.
+        e = edge(anchored[col].iloc[0], o)
+        assert e == pytest.approx(1.0 / booksum - 1.0)
+        assert e < 0
+
+
+def test_a_partly_anchored_league_can_still_produce_an_edge():
+    """Control: below weight 1.0 the model still moves the number, so a large enough
+    disagreement can survive the anchor."""
+    from fv.odds.edge import edge
+
+    f = _frame([0.70, 0.20, 0.10], "H", prices=(2.10, 3.40, 3.80), n=1)
+    anchored = anchor_to_market(f, market_weight=0.6)
+    assert edge(anchored["p_home"].iloc[0], 2.10) > 0

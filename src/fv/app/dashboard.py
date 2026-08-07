@@ -84,6 +84,16 @@ def page_this_week():
             "defaults. Run `fv stages` so these leagues use validated weights."
         )
 
+    if slip.no_edge_possible_leagues:
+        st.error(
+            f"**{', '.join(slip.no_edge_possible_leagues)}: no selection can qualify.** "
+            "Validation gave the market a weight of 1.0 in these leagues, so the "
+            "anchored probability *is* the market's own price and every edge equals "
+            "minus the bookmaker's margin. This is structural, not a quiet week — "
+            "these leagues cannot produce a bet until the model earns weight back "
+            "against the market."
+        )
+
     if slip.all_candidates.empty:
         st.info(
             "**No upcoming fixtures with prices.** football-data.co.uk publishes "

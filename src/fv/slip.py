@@ -183,6 +183,12 @@ class Slip:
     bankroll: float
     generated_at: datetime = field(default_factory=datetime.utcnow)
     untuned_leagues: list[str] = field(default_factory=list)
+    # Leagues whose market anchor tuned to 1.0. There, the anchored probability *is*
+    # the market's own margin-free probability, so every edge equals minus the
+    # bookmaker's margin and no selection can ever clear the threshold. That is a
+    # structural fact about those leagues, not a quiet week, and saying "nothing
+    # qualified" without saying so would imply next week might differ.
+    no_edge_possible_leagues: list[str] = field(default_factory=list)
 
     @property
     def total_stake(self) -> float:
@@ -218,16 +224,20 @@ def generate_slip(
 
     tuned = load_tuned_weights(weights_path)
     untuned = []
+    no_edge = []
     priced = []
     for code, group in upcoming.groupby("league_code"):
         if code not in tuned:
             untuned.append(code)
+        elif tuned[code].get("market_weight", 0.0) >= 1.0:
+            no_edge.append(code)
         frame = predict_fixtures(code, group.reset_index(drop=True), cfg, tuned.get(code))
         if not frame.empty:
             priced.append(frame)
 
     if not priced:
-        return Slip(pd.DataFrame(), pd.DataFrame(), bankroll, untuned_leagues=untuned)
+        return Slip(pd.DataFrame(), pd.DataFrame(), bankroll, untuned_leagues=untuned,
+                    no_edge_possible_leagues=no_edge)
 
     priced_df = pd.concat(priced, ignore_index=True)
 
@@ -264,7 +274,8 @@ def generate_slip(
 
     all_candidates = pd.DataFrame(candidates)
     if all_candidates.empty:
-        return Slip(pd.DataFrame(), all_candidates, bankroll, untuned_leagues=untuned)
+        return Slip(pd.DataFrame(), all_candidates, bankroll, untuned_leagues=untuned,
+                    no_edge_possible_leagues=no_edge)
 
     qualifying = all_candidates[
         all_candidates["in_odds_range"]
@@ -273,7 +284,8 @@ def generate_slip(
     ].copy()
 
     if qualifying.empty:
-        return Slip(pd.DataFrame(), all_candidates, bankroll, untuned_leagues=untuned)
+        return Slip(pd.DataFrame(), all_candidates, bankroll, untuned_leagues=untuned,
+                    no_edge_possible_leagues=no_edge)
 
     qualifying = qualifying.sort_values("edge", ascending=False).head(
         b.get("max_bets_per_week", 8)
@@ -284,7 +296,8 @@ def generate_slip(
     qualifying = qualifying[qualifying["stake"] > 0]
     qualifying = qualifying.sort_values("kickoff_utc").reset_index(drop=True)
 
-    return Slip(qualifying, all_candidates, bankroll, untuned_leagues=untuned)
+    return Slip(qualifying, all_candidates, bankroll, untuned_leagues=untuned,
+                no_edge_possible_leagues=no_edge)
 
 
 SELECTION_WORDS = {"H": "Home", "D": "Draw", "A": "Away"}
@@ -301,8 +314,16 @@ def slip_to_text(slip: Slip) -> str:
     if slip.selections.empty:
         lines.append("No qualifying selections this week.")
         lines.append("")
-        lines.append("This is a normal outcome, not a failure. The thresholds exist")
-        lines.append("to say no; a week with nothing worth backing is the system working.")
+        if slip.no_edge_possible_leagues:
+            leagues = ", ".join(slip.no_edge_possible_leagues)
+            lines.append(f"NOTE - {leagues}: no selection can qualify in these leagues.")
+            lines.append("Validation gave the market a weight of 1.0 there, meaning the")
+            lines.append("model added nothing to the price. Every edge therefore equals")
+            lines.append("minus the bookmaker's margin. This is structural, not a quiet")
+            lines.append("week: these leagues will not produce a bet until the model")
+            lines.append("earns some weight back against the market.")
+            lines.append("")
+        lines.append("A week with nothing worth backing is the thresholds working.")
         return "\n".join(lines)
 
     lines.append(f"{len(slip.selections)} singles, total stake {slip.total_stake:,.2f}")
