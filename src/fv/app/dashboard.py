@@ -114,6 +114,11 @@ def page_this_week():
         display = slip.selections.copy()
         display["match"] = display["home"] + " v " + display["away"]
         display["pick"] = display["selection"].map(SELECTION_WORDS)
+        # Streamlit's "%.1f%%" is a printf format: it appends a percent sign but does
+        # not multiply by 100. These columns hold fractions, so they must be scaled
+        # here or every probability renders 100x too small.
+        for col in ("model_prob", "market_prob_fair", "edge"):
+            display[col] = display[col] * 100.0
         st.dataframe(
             display[["kickoff_utc", "league_code", "match", "pick", "odds", "stake",
                      "model_prob", "market_prob_fair", "edge"]].rename(columns={
@@ -168,6 +173,8 @@ def page_this_week():
         return "; ".join(bits)
 
     cand["reason"] = [why_not(r) for r in cand.itertuples(index=False)]
+    for col in ("model_prob", "market_prob_fair", "edge"):
+        cand[col] = cand[col] * 100.0
     leagues = sorted(cand["league_code"].unique())
     chosen = st.multiselect("Leagues", leagues, default=leagues)
     view = cand[cand["league_code"].isin(chosen)].sort_values("edge", ascending=False)
@@ -199,6 +206,9 @@ def page_backtest():
     if stage_csv.exists():
         st.subheader("Stage-by-stage comparison")
         table = pd.read_csv(stage_csv)
+        for col in ("roi", "roi_lo", "roi_hi", "clv_mean"):
+            if col in table.columns:
+                table[col] = table[col] * 100.0
         st.dataframe(
             table[["stage", "n", "log_loss", "brier", "bets", "roi", "roi_lo",
                    "roi_hi", "clv_mean", "clv_significant"]],
@@ -237,7 +247,9 @@ def page_backtest():
     with c1:
         st.subheader("ROI by league")
         by_league = bets.groupby("league_code").apply(
-            lambda g: pd.Series({"bets": len(g), "roi": g["pnl"].sum() / g["stake"].sum()}),
+            lambda g: pd.Series(
+                {"bets": len(g), "roi": 100.0 * g["pnl"].sum() / g["stake"].sum()}
+            ),
             include_groups=False,
         ).reset_index()
         st.dataframe(by_league, hide_index=True, use_container_width=True,
@@ -245,7 +257,9 @@ def page_backtest():
     with c2:
         st.subheader("ROI by season")
         by_season = bets.groupby("season").apply(
-            lambda g: pd.Series({"bets": len(g), "roi": g["pnl"].sum() / g["stake"].sum()}),
+            lambda g: pd.Series(
+                {"bets": len(g), "roi": 100.0 * g["pnl"].sum() / g["stake"].sum()}
+            ),
             include_groups=False,
         ).reset_index()
         st.dataframe(by_season, hide_index=True, use_container_width=True,
