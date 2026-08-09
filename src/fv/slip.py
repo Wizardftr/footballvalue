@@ -214,6 +214,31 @@ def anchor_over_under(
     return out
 
 
+def _take_market_mix(
+    eligible: pd.DataFrame, mix: dict[str, int], rank_column: str
+) -> pd.DataFrame:
+    """Take a fixed number of picks from each market, never twice from one match.
+
+    Markets are filled in order of how scarce their fixtures are, so a market with
+    few priced matches gets first refusal. Filling the plentiful one first would let
+    it take the shared matches and leave the scarce one short for no reason.
+    """
+    order = sorted(mix, key=lambda m: eligible[eligible["market"] == m]["match_id"].nunique())
+    used: set = set()
+    chosen = []
+    for market in order:
+        wanted = int(mix.get(market, 0))
+        if wanted <= 0:
+            continue
+        pool = eligible[(eligible["market"] == market) & (~eligible["match_id"].isin(used))]
+        picks = pool.sort_values(rank_column, ascending=False).head(wanted)
+        used.update(picks["match_id"])
+        chosen.append(picks)
+    if not chosen:
+        return eligible.head(0).copy()
+    return pd.concat(chosen).copy()
+
+
 @dataclass
 class Slip:
     selections: pd.DataFrame
@@ -232,6 +257,43 @@ class Slip:
     mode: str = "value"
     # "value" ranks by disagreement with the price, "likely" by win probability.
     rank_by: str = "value"
+
+    @property
+    def combined_odds(self) -> float:
+        """What the whole slip would pay as a single combined bet.
+
+        Provided because people ask, and because the alternative is that they work
+        it out on the bookmaker's site where nothing tells them what it costs. See
+        :meth:`combination_verdict`.
+        """
+        if self.selections.empty:
+            return 0.0
+        return float(self.selections["odds"].prod())
+
+    @property
+    def combined_chance(self) -> float:
+        """Model probability that every leg lands. Legs are treated as independent,
+        which is close enough across different matches and wrong within one - which
+        is itself a reason the slip never puts two legs on the same match."""
+        if self.selections.empty:
+            return 0.0
+        return float(self.selections["model_prob"].prod())
+
+    def combination_verdict(self, stake: float) -> dict:
+        """Combined bet versus the same money spread over singles, side by side."""
+        odds, chance = self.combined_odds, self.combined_chance
+        singles_ev = float(
+            (stake / len(self.selections) * self.selections["edge"]).sum()
+        ) if not self.selections.empty else 0.0
+        return {
+            "odds": odds,
+            "returns": stake * odds,
+            "chance": chance,
+            "one_in": (1.0 / chance) if chance > 0 else float("inf"),
+            "expected_profit": stake * (odds * chance - 1.0),
+            "expected_profit_as_singles": singles_ev,
+            "expected_winners_as_singles": float(self.selections["model_prob"].sum()),
+        }
 
     @property
     def total_stake(self) -> float:
@@ -256,6 +318,7 @@ def generate_slip(
     weights_path: Path | None = None,
     fill_to: int | None = None,
     rank_by: str = "value",
+    market_mix: dict[str, int] | None = None,
 ) -> Slip:
     """Build this week's slip.
 
@@ -279,6 +342,12 @@ def generate_slip(
     """
     if rank_by not in ("value", "likely"):
         raise ValueError(f"rank_by must be 'value' or 'likely', got {rank_by!r}")
+    if market_mix:
+        unknown = set(market_mix) - {"1X2", "OU25"}
+        if unknown:
+            raise ValueError(f"unknown markets in market_mix: {sorted(unknown)}")
+        if any(int(n) < 0 for n in market_mix.values()):
+            raise ValueError("market_mix counts must not be negative")
     cfg = cfg or load_config()
     b = cfg.betting
     bankroll = bankroll if bankroll is not None else b.get("starting_bankroll", 1000.0)
@@ -384,25 +453,29 @@ def generate_slip(
     # are not independent either - the same red card moves both. Keeping it to one
     # means eight picks are eight matches, which is what the stake caps assume.
     rank_column = "model_prob" if rank_by == "likely" else "edge"
-    eligible = (
-        eligible.sort_values(rank_column, ascending=False)
-        .drop_duplicates(subset="match_id", keep="first")
-    )
+    eligible = eligible.sort_values(rank_column, ascending=False)
 
-    if fill_to:
-        qualifying = eligible.head(fill_to).copy()
+    if market_mix:
+        # The mix decides which market each match is used for, so the one-per-match
+        # rule is enforced inside it rather than by pre-filtering to a single row.
+        qualifying = _take_market_mix(eligible, market_mix, rank_column)
         mode = "filled"
     else:
-        qualifying = eligible[eligible["clears_edge"]].copy()
-        qualifying = qualifying.sort_values(rank_column, ascending=False).head(
-            b.get("max_bets_per_week", 8)
-        )
-        mode = "value"
+        eligible = eligible.drop_duplicates(subset="match_id", keep="first")
+        if fill_to:
+            qualifying = eligible.head(fill_to).copy()
+            mode = "filled"
+        else:
+            qualifying = eligible[eligible["clears_edge"]].copy()
+            qualifying = qualifying.sort_values(rank_column, ascending=False).head(
+                b.get("max_bets_per_week", 8)
+            )
+            mode = "value"
 
     if qualifying.empty:
         return Slip(pd.DataFrame(), all_candidates, bankroll, untuned_leagues=untuned,
                     no_edge_possible_leagues=no_edge, mode=mode)
-    if fill_to:
+    if mode == "filled":
         # Kelly correctly stakes nothing on a negative edge, so a filled slip has to
         # use a flat stake. It is capped at the same fraction of bankroll a Kelly bet
         # would be, so a filled slip can never risk more than a value slip would.

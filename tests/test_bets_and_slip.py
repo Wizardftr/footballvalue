@@ -421,3 +421,77 @@ def test_rank_by_is_validated():
 
     with pytest.raises(ValueError, match="rank_by"):
         generate_slip(rank_by="whatever")
+
+
+def test_market_mix_validates_its_markets():
+    from fv.slip import generate_slip
+
+    with pytest.raises(ValueError, match="unknown markets"):
+        generate_slip(market_mix={"BTTS": 3})
+    with pytest.raises(ValueError, match="negative"):
+        generate_slip(market_mix={"OU25": -1})
+
+
+def test_market_mix_takes_the_asked_for_number_from_each_market():
+    from fv.slip import _take_market_mix
+
+    rows = pd.DataFrame([
+        {"match_id": 1, "market": "OU25", "edge": 0.9},
+        {"match_id": 1, "market": "1X2", "edge": 0.8},
+        {"match_id": 2, "market": "OU25", "edge": 0.7},
+        {"match_id": 2, "market": "1X2", "edge": 0.6},
+        {"match_id": 3, "market": "OU25", "edge": 0.5},
+        {"match_id": 3, "market": "1X2", "edge": 0.4},
+        {"match_id": 4, "market": "1X2", "edge": 0.3},
+    ])
+    out = _take_market_mix(rows, {"OU25": 2, "1X2": 2}, "edge")
+    assert list(out["market"]).count("OU25") == 2
+    assert list(out["market"]).count("1X2") == 2
+    # Never two legs off one match: a combined bet on both would be correlated, and
+    # the stake caps assume one pick means one match.
+    assert out["match_id"].nunique() == 4
+
+
+def test_market_mix_gives_the_scarcer_market_first_refusal():
+    """Filling the plentiful market first would let it take the shared matches and
+    leave the scarce one short for no reason."""
+    from fv.slip import _take_market_mix
+
+    rows = pd.DataFrame([
+        {"match_id": 1, "market": "OU25", "edge": 0.5},
+        {"match_id": 1, "market": "1X2", "edge": 0.9},
+        {"match_id": 2, "market": "1X2", "edge": 0.8},
+        {"match_id": 3, "market": "1X2", "edge": 0.7},
+    ])
+    out = _take_market_mix(rows, {"OU25": 1, "1X2": 2}, "edge")
+    assert list(out["market"]).count("OU25") == 1
+    assert list(out["market"]).count("1X2") == 2
+
+
+def test_combination_verdict_is_arithmetically_honest():
+    from fv.slip import Slip
+
+    sel = pd.DataFrame([
+        {"odds": 2.0, "model_prob": 0.5, "edge": 0.0},
+        {"odds": 2.0, "model_prob": 0.5, "edge": 0.0},
+    ])
+    v = Slip(sel, pd.DataFrame(), 100.0).combination_verdict(10.0)
+    assert v["odds"] == pytest.approx(4.0)
+    assert v["chance"] == pytest.approx(0.25)
+    assert v["returns"] == pytest.approx(40.0)
+    # Fair prices both ways: combining a fair bet is still fair, so the two expected
+    # profits agree at zero. Any margin makes the combined one strictly worse.
+    assert v["expected_profit"] == pytest.approx(0.0)
+    assert v["expected_profit_as_singles"] == pytest.approx(0.0)
+
+
+def test_combining_real_priced_legs_is_worse_than_singles():
+    from fv.slip import Slip
+
+    sel = pd.DataFrame([
+        {"odds": 1.90, "model_prob": 0.5, "edge": -0.05},
+        {"odds": 1.90, "model_prob": 0.5, "edge": -0.05},
+        {"odds": 1.90, "model_prob": 0.5, "edge": -0.05},
+    ])
+    v = Slip(sel, pd.DataFrame(), 100.0).combination_verdict(6.0)
+    assert v["expected_profit"] < v["expected_profit_as_singles"] < 0

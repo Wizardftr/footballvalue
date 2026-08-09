@@ -132,6 +132,16 @@ def page_this_week():
             set_setting("slip_fill_n", how_many, user_id=_uid())
         set_setting("slip_fill_mode", always, user_id=_uid())
 
+        st.markdown("**Mix of markets**")
+        st.caption("Leave both at 0 to just take the best picks whatever the market.")
+        m1, m2 = st.columns(2)
+        n_goals = int(m1.number_input("Goals picks (over/under 2.5)", 0, 10,
+                                      int(get_setting("mix_goals", 0, user_id=_uid()))))
+        n_winner = int(m2.number_input("Winner picks (home/draw/away)", 0, 10,
+                                       int(get_setting("mix_winner", 0, user_id=_uid()))))
+        set_setting("mix_goals", n_goals, user_id=_uid())
+        set_setting("mix_winner", n_winner, user_id=_uid())
+
         order = st.radio(
             "Put in order by",
             ["Best value", "Most likely to win"],
@@ -143,9 +153,13 @@ def page_this_week():
         rank_by = "value" if order == "Best value" else "likely"
         set_setting("rank_by", rank_by, user_id=_uid())
 
+    n_goals = int(get_setting("mix_goals", 0, user_id=_uid()))
+    n_winner = int(get_setting("mix_winner", 0, user_id=_uid()))
+    mix = {"OU25": n_goals, "1X2": n_winner} if (n_goals or n_winner) else None
+
     with st.spinner("Working out this week's prices…"):
         slip = generate_slip(bankroll=balance, fill_to=how_many if always else None,
-                             rank_by=rank_by)
+                             rank_by=rank_by, market_mix=mix)
 
     if slip.all_candidates.empty:
         st.info(
@@ -170,15 +184,16 @@ def page_this_week():
         st.warning(
             f"**These are the best available, not good ones.** The model expects this "
             f"list to lose about {_money(abs(slip.expected_return))} of the "
-            f"{_money(slip.total_stake)} staked. You asked for {how_many} picks every "
-            "week, so it gave you the least-bad {n}. Keep this in practice mode."
-            .replace("{n}", str(len(slip.selections)))
+            f"{_money(slip.total_stake)} staked. You asked for a set number of picks, "
+            f"so it gave you the least-bad {len(slip.selections)}. Keep this in "
+            "practice mode."
         )
 
     st.subheader(f"Your {len(slip.selections)} picks")
     st.caption(f"Total to stake: **{_money(slip.total_stake)}** — "
                f"{slip.total_stake / balance:.0%} of your balance. "
-               "**Place these as separate bets.** Never combine them into one.")
+               "**Best placed as separate bets** — see below for exactly what "
+               "combining them costs.")
 
     table = slip.selections.copy()
     table["Match"] = table["home"] + "  v  " + table["away"]
@@ -218,6 +233,9 @@ def page_this_week():
         st.cache_data.clear()
         st.success(f"Saved {n} picks. Results fill in automatically as matches finish.")
 
+    if len(slip.selections) > 1:
+        _combination_panel(slip)
+
     with st.expander("Why these matches?"):
         st.caption(
             "A match only appears when the model thinks a result is more likely than "
@@ -255,6 +273,36 @@ def page_this_week():
 
     _why_not_table(slip, names)
     glossary()
+
+
+def _combination_panel(slip):
+    """What the slip pays as one combined bet, and what that costs.
+
+    This exists because the alternative is worse. Somebody who wants a big return
+    from a small stake will build the combination on the bookmaker's site, where
+    nothing shows the chance of it landing or how much the combining itself takes.
+    Here the same numbers are on screen next to it.
+    """
+    with st.expander("Combine these into one bet?"):
+        stake = st.number_input("Stake on the combined bet (€)", min_value=0.50,
+                                value=5.00, step=0.50)
+        v = slip.combination_verdict(stake)
+        c1, c2, c3 = st.columns(3)
+        theme.card("Combined odds", f"{v['odds']:.2f}",
+                   f"{_money(stake)} returns {_money(v['returns'])}", container=c1)
+        theme.card("Chance all of them land", f"{v['chance']:.1%}",
+                   f"about 1 in {v['one_in']:.0f}", container=c2)
+        theme.card("Expected profit", _money(v["expected_profit"]),
+                   tone="bad" if v["expected_profit"] < 0 else "accent", container=c3)
+        st.warning(
+            f"**The same {_money(stake)} spread over {len(slip.selections)} separate "
+            f"bets has an expected profit of {_money(v['expected_profit_as_singles'])}, "
+            f"against {_money(v['expected_profit'])} combined.** Combining does not "
+            "change any single prediction — it multiplies the bookmaker's cut by the "
+            f"number of legs. As singles you would expect about "
+            f"{v['expected_winners_as_singles']:.1f} of {len(slip.selections)} to come "
+            "in and get paid on each; combined, one loser pays nothing at all."
+        )
 
 
 def _why_not_table(slip, names):
