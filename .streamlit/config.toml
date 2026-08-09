@@ -1,0 +1,20 @@
+# Visual identity. Deliberately not green-on-black: green reads as "profit" in a
+# betting context, and this app's whole argument is that profit is not established.
+# The accent is a cool teal, used for navigation and focus rather than for outcomes.
+[theme]
+base = "dark"
+primaryColor = "#4FB3A9"
+backgroundColor = "#0E141B"
+secondaryBackgroundColor = "#171F29"
+textColor = "#E4EBF2"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = false
+
+[browser]
+gatherUsageStats = false
+
+[server]
+runOnSave = false

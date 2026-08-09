@@ -181,7 +181,7 @@ def test_no_tool_can_move_money(cfg):
     """The assistant may read and may tune thresholds. It may not bet."""
     names = set(chat.build_tools(cfg))
     assert names == {
-        "run_sql", "describe_schema", "get_settings",
+        "run_sql", "describe_schema", "get_settings", "my_bets",
         "update_setting", "performance_summary", "backtest_summary",
     }
 
@@ -287,3 +287,21 @@ def test_request_uses_the_configured_model_and_no_sampling_params(cfg):
     assert sent["thinking"] == {"type": "adaptive"}
     # Opus 5 rejects these outright; a stray default would 400 every request.
     assert not {"temperature", "top_p", "top_k", "budget_tokens"} & set(sent)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM bets",
+    "SELECT stake FROM Bets WHERE user_id = 2",
+    "SELECT balance_after FROM bankroll_events ORDER BY id DESC LIMIT 1",
+    "SELECT email, password_hash FROM users",
+    "SELECT value_json FROM user_settings",
+    "SELECT m.id FROM matches m JOIN bets b ON b.match_id = m.id",
+])
+def test_private_tables_are_unreachable_from_sql(cfg, sql):
+    """Read-only is not enough once the app has more than one account.
+
+    These tables hold one person's money and password hash. SQL reaches shared
+    football data only; the per-user tools are the sole route to the rest.
+    """
+    with pytest.raises(chat.QueryError, match="private per-account data"):
+        chat.run_sql(sql, cfg=cfg)

@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from fv import chat
+from fv import auth, chat
+from fv.app import theme
 from fv.bets import (
     bankroll_history,
     bet_log,
@@ -35,11 +36,26 @@ from fv.settings_store import (
     real_money_readiness,
     set_setting,
 )
+from fv.db.migrate import ensure_schema
 from fv.slip import generate_slip, slip_to_csv, slip_to_text
 
-st.set_page_config(page_title="footballvalue", page_icon="⚽", layout="wide")
+st.set_page_config(
+    page_title="footballvalue",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 SELECTION_WORDS = {"H": "Home", "D": "Draw", "A": "Away"}
+
+
+def _uid() -> int:
+    """The signed-in account's id. Every page runs behind the sign-in gate."""
+    return st.session_state.account.id
+
+
+def _account():
+    return st.session_state.account
 
 
 def _pct(x, digits=2):
@@ -49,13 +65,15 @@ def _pct(x, digits=2):
 
 
 @st.cache_data(ttl=300)
-def _cached_bet_log():
-    return bet_log()
+def _cached_bet_log(user_id: int):
+    """Keyed on the user id on purpose: an unkeyed cache would hand one account
+    another account's bet log for five minutes."""
+    return bet_log(user_id=user_id)
 
 
 def _readiness_banner():
     """The honest verdict, shown wherever real money could be a temptation."""
-    r = real_money_readiness()
+    r = real_money_readiness(user_id=_uid())
     if r.ready:
         st.success(f"**{r.headline}**")
         return r
@@ -70,9 +88,11 @@ def _readiness_banner():
 # ---------------------------------------------------------------------------
 
 def page_this_week():
-    st.title("This Week")
-    settings = effective_settings()
-    bankroll = current_bankroll()
+    theme.hero("This Week",
+               "Fixtures the model has priced, what it disagrees with bet365 about, "
+               "and the slip that follows from your thresholds.")
+    settings = effective_settings(user_id=_uid())
+    bankroll = current_bankroll(user_id=_uid())
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Bankroll", f"{bankroll:,.2f}")
@@ -85,7 +105,7 @@ def page_this_week():
     c1, c2 = st.columns([1, 3])
     fill_mode = c1.toggle(
         "Always give me a slip",
-        value=bool(get_setting("slip_fill_mode", False)),
+        value=bool(get_setting("slip_fill_mode", False, user_id=_uid())),
         help="Off: only selections that clear the edge threshold, so a week with no "
              "value gives an empty slip. On: the best N by edge regardless, so there "
              "is always something to place.",
@@ -93,11 +113,11 @@ def page_this_week():
     fill_n = None
     if fill_mode:
         fill_n = int(c2.slider("Selections per week", 1, 20,
-                               int(get_setting("slip_fill_n", 10))))
-        set_setting("slip_fill_mode", True)
-        set_setting("slip_fill_n", fill_n)
+                               int(get_setting("slip_fill_n", 10, user_id=_uid()))))
+        set_setting("slip_fill_mode", True, user_id=_uid())
+        set_setting("slip_fill_n", fill_n, user_id=_uid())
     else:
-        set_setting("slip_fill_mode", False)
+        set_setting("slip_fill_mode", False, user_id=_uid())
 
     with st.spinner("Fitting models and pricing fixtures…"):
         slip = generate_slip(bankroll=bankroll, fill_to=fill_n)
@@ -182,7 +202,7 @@ def page_this_week():
                            file_name=f"slip-{datetime.utcnow():%Y%m%d}.csv")
         mode = "paper" if settings["paper_mode"] else "real"
         if c3.button(f"Log these {len(slip.selections)} bets as {mode}", type="primary"):
-            slip_id, n = log_slip(slip.selections, mode=mode)
+            slip_id, n = log_slip(slip.selections, mode=mode, user_id=_uid())
             st.cache_data.clear()
             st.success(f"Logged {n} bets as {slip_id}.")
 
@@ -235,7 +255,9 @@ def page_this_week():
 # ---------------------------------------------------------------------------
 
 def page_backtest():
-    st.title("Backtest")
+    theme.hero("Backtest",
+               "Walk-forward results on held-out seasons, priced against bet365's own "
+               "closing odds. This is the evidence the real-money gate reads.")
     stages_dir = PROJECT_ROOT / "reports" / "stages"
     flat_dir = PROJECT_ROOT / "reports" / "flat"
 
@@ -335,9 +357,11 @@ def page_backtest():
 # ---------------------------------------------------------------------------
 
 def page_bankroll():
-    st.title("Bankroll")
-    log = _cached_bet_log()
-    balance = current_bankroll()
+    theme.hero("Bankroll",
+               "Your balance, your bets, and how they are actually doing — judged on "
+               "the rolling window and CLV, never on a single month.")
+    log = _cached_bet_log(_uid())
+    balance = current_bankroll(user_id=_uid())
 
     settled = log[log["status"].isin(("won", "lost"))] if not log.empty else pd.DataFrame()
 
@@ -430,7 +454,7 @@ def page_bankroll():
         override = st.number_input("P&L override (0 to compute automatically)", value=0.0)
         if st.button("Apply manual settlement"):
             try:
-                manual_settle(int(bet_id), status, override or None)
+                manual_settle(int(bet_id), status, override or None, user_id=_uid())
                 st.cache_data.clear()
                 st.success(f"Bet {int(bet_id)} set to {status}.")
             except (KeyError, ValueError) as exc:
@@ -439,12 +463,13 @@ def page_bankroll():
     with st.expander("Bankroll ledger"):
         st.caption("Append-only. The balance is derived from these events, never "
                    "edited in place.")
-        st.dataframe(bankroll_history(), hide_index=True, use_container_width=True)
+        st.dataframe(bankroll_history(user_id=_uid()), hide_index=True, use_container_width=True)
         c1, c2 = st.columns(2)
         amount = c1.number_input("Deposit / withdrawal", value=0.0, step=10.0)
         if c2.button("Record") and amount:
             record_bankroll_event(
-                "deposit" if amount > 0 else "withdrawal", amount, note="manual"
+                "deposit" if amount > 0 else "withdrawal", amount, note="manual",
+                user_id=_uid(),
             )
             st.cache_data.clear()
             st.success("Recorded.")
@@ -466,9 +491,10 @@ def _longest_losing_streak(settled: pd.DataFrame) -> int:
 # ---------------------------------------------------------------------------
 
 def page_settings():
-    st.title("Settings")
+    theme.hero("Settings", "Thresholds, staking and risk controls. These are yours "
+                           "alone; other accounts keep their own.")
     cfg = load_config()
-    s = effective_settings()
+    s = effective_settings(user_id=_uid())
 
     st.subheader("Real-money mode")
     readiness = _readiness_banner()
@@ -497,7 +523,7 @@ def page_settings():
             "exist. You can still do it — but do it knowing that."
         )
     if st.button("Save mode"):
-        set_setting("paper_mode", bool(paper))
+        set_setting("paper_mode", bool(paper), user_id=_uid())
         st.success("Saved.")
 
     st.divider()
@@ -541,7 +567,7 @@ def page_settings():
             "max_bets_per_week": int(max_bets), "weekly_stop_loss_pct": stop_loss,
             "max_drawdown_pct": max_dd, "enabled_leagues": enabled,
         }.items():
-            set_setting(key, value)
+            set_setting(key, value, user_id=_uid())
         st.cache_data.clear()
         st.success("Saved. These override config.yaml.")
 
@@ -551,11 +577,11 @@ def page_settings():
 # ---------------------------------------------------------------------------
 
 def page_ask():
-    st.title("Ask")
-    st.caption(
-        "An assistant with read-only SQL access to this app's database. It can look "
-        "things up and change your thresholds — it cannot place, log or settle bets, "
-        "and it cannot turn off paper trading mode."
+    theme.hero(
+        "Ask",
+        "An assistant with read-only access to the database. It can look things up "
+        "and change your thresholds. It cannot place, log or settle bets, it cannot "
+        "turn off paper trading, and it only ever sees your own bets.",
     )
 
     usable, reason = chat.is_available()
@@ -614,24 +640,193 @@ def page_ask():
         st.rerun()
 
 
-PAGES = {
-    "This Week": page_this_week,
-    "Backtest": page_backtest,
-    "Bankroll": page_bankroll,
-    "Settings": page_settings,
-    "Ask": page_ask,
-}
+# ---------------------------------------------------------------------------
+# Page 6: Account (everyone) and People (owner only)
+# ---------------------------------------------------------------------------
+
+def page_account():
+    account = _account()
+    theme.hero("Account", "Your sign-in details and password.")
+
+    c1, c2 = st.columns(2)
+    theme.card("Signed in as", account.display_name, account.email, container=c1)
+    theme.card("Role", account.role.title(),
+               "Owners can add and disable accounts." if account.is_owner
+               else "Members see only their own bets and bankroll.", container=c2)
+
+    st.subheader("Change password")
+    with st.form("change_password", clear_on_submit=True):
+        current = st.text_input("Current password", type="password")
+        new = st.text_input("New password", type="password")
+        again = st.text_input("Confirm new password", type="password")
+        if st.form_submit_button("Update password", type="primary"):
+            if new != again:
+                st.error("The two new passwords do not match.")
+            else:
+                try:
+                    auth.change_password(account.id, current, new)
+                    st.success("Password updated.")
+                except auth.AuthError as exc:
+                    st.error(str(exc))
+
+    st.caption(
+        "Signing in is per browser session — refreshing the page signs you out "
+        "again. Nothing about your login is stored on this device."
+    )
+
+
+def page_people():
+    theme.hero("People", "Accounts on this instance. Each one has its own bankroll, "
+                         "bet history and settings — nobody sees anybody else's.")
+    if not _account().is_owner:
+        st.error("Only the owner can manage accounts.")
+        return
+
+    users = auth.list_users()
+    st.dataframe(
+        pd.DataFrame(users)[["id", "display_name", "email", "role", "is_active",
+                             "last_login_at"]].rename(columns={
+            "display_name": "name", "is_active": "active", "last_login_at": "last seen"}),
+        hide_index=True, use_container_width=True,
+    )
+
+    st.subheader("Add someone")
+    st.caption("There is no public signup: you create the account and send them the "
+               "password yourself.")
+    with st.form("add_user", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        email = c1.text_input("Email")
+        name = c2.text_input("Display name")
+        c1, c2 = st.columns(2)
+        password = c1.text_input("Temporary password", type="password")
+        role = c2.selectbox("Role", ["member", "owner"])
+        if st.form_submit_button("Create account", type="primary"):
+            try:
+                created = auth.create_user(email, password, name or None, role)
+                st.success(f"Created {created.email}. Send them that password and ask "
+                           "them to change it on the Account page.")
+            except auth.AuthError as exc:
+                st.error(str(exc))
+
+    st.subheader("Disable or re-enable")
+    others = [u for u in users if u["id"] != _account().id]
+    if not others:
+        st.caption("No other accounts yet.")
+    else:
+        labels = {u["id"]: f"{u['display_name']} <{u['email']}>" for u in others}
+        target = st.selectbox("Account", list(labels), format_func=labels.get)
+        active = next(u["is_active"] for u in others if u["id"] == target)
+        if st.button("Re-enable" if not active else "Disable"):
+            try:
+                auth.set_active(target, not active)
+                st.rerun()
+            except auth.AuthError as exc:
+                st.error(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Sign-in
+# ---------------------------------------------------------------------------
+
+def sign_in_screen():
+    """The whole app sits behind this. No navigation is built until it passes."""
+    # Columns, not a wrapping <div>: Streamlit renders each element in its own
+    # container, so an opened div never actually wraps what follows it.
+    _, middle, _ = st.columns([1, 1.15, 1])
+    with middle:
+        st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
+        theme.wordmark()
+
+        if auth.user_count() == 0 or _only_local_account():
+            st.info(
+                "**No accounts yet.** Create the first one from a terminal:\n\n"
+                "```\nuv run fv user add you@example.com --owner\n```\n"
+                "Then sign in here."
+            )
+            return
+
+        with st.form("sign_in"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            if st.form_submit_button("Sign in", type="primary", use_container_width=True):
+                try:
+                    st.session_state.account = auth.authenticate(email, password)
+                    st.rerun()
+                except auth.AuthError as exc:
+                    st.error(str(exc))
+        st.caption("No public signup — the owner creates accounts.")
+    theme.legal_footer()
+
+
+def _only_local_account() -> bool:
+    """True when the only account is the placeholder the CLI created for itself.
+
+    That account has an unusable password hash, so showing a login form for it would
+    be a dead end — better to say plainly that a real account has to be made first.
+    """
+    users = auth.list_users()
+    return bool(users) and all(u["email"] == auth.LOCAL_EMAIL for u in users)
+
+
+# ---------------------------------------------------------------------------
+# Shell
+# ---------------------------------------------------------------------------
+
+def sidebar():
+    account = _account()
+    settings = effective_settings(user_id=_uid())
+
+    st.sidebar.markdown(
+        f"<div style='color:{theme.MUTED};font-size:.8rem'>Signed in as</div>"
+        f"<div style='font-weight:600;margin-bottom:.6rem'>{account.display_name}</div>",
+        unsafe_allow_html=True,
+    )
+    st.sidebar.metric("Bankroll", f"{current_bankroll(user_id=_uid()):,.2f}")
+    st.sidebar.caption(
+        "Paper mode — no real money" if settings["paper_mode"]
+        else "**REAL MONEY MODE**"
+    )
+    st.sidebar.divider()
+    if st.sidebar.button("Sign out", use_container_width=True):
+        st.session_state.pop("account", None)
+        st.session_state.pop("ask_messages", None)
+        st.session_state.pop("ask_display", None)
+        st.cache_data.clear()
+        st.rerun()
 
 
 def main():
-    st.sidebar.title("⚽ footballvalue")
-    st.sidebar.caption("Analysis only. It never places bets.")
-    choice = st.sidebar.radio("Page", list(PAGES))
-    settings = effective_settings()
-    st.sidebar.divider()
-    st.sidebar.metric("Bankroll", f"{current_bankroll():,.2f}")
-    st.sidebar.caption("**Paper mode**" if settings["paper_mode"] else "**REAL MONEY MODE**")
-    PAGES[choice]()
+    theme.inject()
+    ensure_schema()
+
+    if "account" not in st.session_state:
+        sign_in_screen()
+        return
+
+    # An account disabled while its session is open should lose access on the next
+    # click, not at the next sign-in.
+    live = auth.get_account(st.session_state.account.id)
+    if live is None:
+        st.session_state.pop("account", None)
+        st.warning("That account is no longer active.")
+        sign_in_screen()
+        return
+    st.session_state.account = live
+
+    sidebar()
+
+    pages = [
+        st.Page(page_this_week, title="This Week", icon=":material/sports_soccer:", default=True),
+        st.Page(page_backtest, title="Backtest", icon=":material/timeline:"),
+        st.Page(page_bankroll, title="Bankroll", icon=":material/account_balance_wallet:"),
+        st.Page(page_ask, title="Ask", icon=":material/forum:"),
+        st.Page(page_settings, title="Settings", icon=":material/tune:"),
+        st.Page(page_account, title="Account", icon=":material/person:"),
+    ]
+    if live.is_owner:
+        pages.append(st.Page(page_people, title="People", icon=":material/group:"))
+    st.navigation(pages).run()
+    theme.legal_footer()
 
 
 main()

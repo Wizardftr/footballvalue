@@ -15,6 +15,7 @@ from datetime import datetime
 import pandas as pd
 from sqlalchemy import func, select, text
 
+from fv.auth import local_user_id
 from fv.config import Config, load_config
 from fv.db.models import BankrollEvent, Bet, Match
 from fv.db.session import get_engine, session_scope
@@ -26,12 +27,21 @@ def new_slip_id() -> str:
     return f"slip-{datetime.utcnow():%Y%m%d}-{uuid.uuid4().hex[:6]}"
 
 
-def current_bankroll(cfg: Config | None = None) -> float:
-    """Balance from the ledger; falls back to the configured starting bankroll."""
+def current_bankroll(cfg: Config | None = None, user_id: int | None = None) -> float:
+    """Balance from one user's ledger; falls back to the configured starting bankroll.
+
+    Every bankroll function takes ``user_id=None`` to mean "the account the command
+    line acts as", so scripts and tests keep working unchanged while the web app
+    passes the signed-in user explicitly.
+    """
     cfg = cfg or load_config()
+    uid = user_id if user_id is not None else local_user_id(cfg)
     with session_scope(cfg) as s:
         last = s.scalar(
-            select(BankrollEvent).order_by(BankrollEvent.ts.desc(), BankrollEvent.id.desc()).limit(1)
+            select(BankrollEvent)
+            .where(BankrollEvent.user_id == uid)
+            .order_by(BankrollEvent.ts.desc(), BankrollEvent.id.desc())
+            .limit(1)
         )
         if last is not None:
             return float(last.balance_after)
@@ -44,13 +54,16 @@ def record_bankroll_event(
     note: str | None = None,
     bet_id: int | None = None,
     cfg: Config | None = None,
+    user_id: int | None = None,
 ) -> float:
     """Append a ledger entry and return the new balance."""
     cfg = cfg or load_config()
-    balance = current_bankroll(cfg) + amount
+    uid = user_id if user_id is not None else local_user_id(cfg)
+    balance = current_bankroll(cfg, uid) + amount
     with session_scope(cfg) as s:
         s.add(
             BankrollEvent(
+                user_id=uid,
                 ts=datetime.utcnow(),
                 type=event_type,
                 amount=float(amount),
@@ -67,6 +80,7 @@ def log_slip(
     mode: str = "paper",
     slip_id: str | None = None,
     cfg: Config | None = None,
+    user_id: int | None = None,
 ) -> tuple[str, int]:
     """Record a slip's selections as pending bets. Returns (slip_id, count).
 
@@ -75,6 +89,7 @@ def log_slip(
     every winning bet's stake.
     """
     cfg = cfg or load_config()
+    uid = user_id if user_id is not None else local_user_id(cfg)
     slip_id = slip_id or new_slip_id()
     if selections.empty:
         return slip_id, 0
@@ -84,6 +99,7 @@ def log_slip(
         for r in selections.itertuples(index=False):
             already = s.scalar(
                 select(Bet).where(
+                    Bet.user_id == uid,
                     Bet.match_id == int(r.match_id),
                     Bet.selection == r.selection,
                     Bet.status == "pending",
@@ -93,6 +109,7 @@ def log_slip(
                 continue  # never log the same pending bet twice
             s.add(
                 Bet(
+                    user_id=uid,
                     slip_id=slip_id,
                     match_id=int(r.match_id),
                     selection=r.selection,
@@ -182,7 +199,8 @@ def settle_pending(cfg: Config | None = None) -> SettlementStats:
             already = _has_ledger_entry(bet.id, cfg)
             if not already and bet.pnl is not None:
                 record_bankroll_event(
-                    "settlement", float(bet.pnl), note=f"bet {bet.id}", bet_id=bet.id, cfg=cfg
+                    "settlement", float(bet.pnl), note=f"bet {bet.id}", bet_id=bet.id,
+                    cfg=cfg, user_id=bet.user_id,
                 )
     return stats
 
@@ -199,8 +217,14 @@ def manual_settle(
     status: str,
     pnl: float | None = None,
     cfg: Config | None = None,
+    user_id: int | None = None,
 ) -> None:
-    """Override a settlement by hand, for the cases auto-settlement can't see."""
+    """Override a settlement by hand, for the cases auto-settlement can't see.
+
+    ``user_id`` is an authorisation check, not a filter: passing one means "this
+    person is editing their own bet", and editing somebody else's is refused rather
+    than silently ignored.
+    """
     if status not in ("won", "lost", "void", "pending"):
         raise ValueError(f"invalid status: {status}")
     cfg = cfg or load_config()
@@ -208,6 +232,9 @@ def manual_settle(
         bet = s.get(Bet, bet_id)
         if bet is None:
             raise KeyError(f"no bet with id {bet_id}")
+        if user_id is not None and bet.user_id != user_id:
+            raise KeyError(f"no bet with id {bet_id}")
+        owner_id = bet.user_id
         old_pnl = bet.pnl or 0.0
         if pnl is None:
             pnl = (
@@ -222,7 +249,8 @@ def manual_settle(
 
     if delta:
         record_bankroll_event(
-            "adjustment", delta, note=f"manual settle of bet {bet_id}", bet_id=bet_id, cfg=cfg
+            "adjustment", delta, note=f"manual settle of bet {bet_id}", bet_id=bet_id,
+            cfg=cfg, user_id=owner_id,
         )
 
 
@@ -231,32 +259,36 @@ SELECT b.id, b.slip_id, b.mode, b.status, b.selection, b.odds_taken, b.stake,
        b.pnl, b.closing_odds, b.clv, b.placed_at, b.settled_at, b.settled_by,
        m.league_code, m.season, m.kickoff_utc,
        th.canonical_name AS home, ta.canonical_name AS away,
-       m.fthg, m.ftag
+       m.fthg, m.ftag, b.user_id
 FROM bets b
 JOIN matches m ON m.id = b.match_id
 JOIN teams th ON th.id = m.home_team_id
 JOIN teams ta ON ta.id = m.away_team_id
+WHERE (:user_id IS NULL OR b.user_id = :user_id)
 ORDER BY m.kickoff_utc DESC, b.id DESC
 """
 
 
-def bet_log(cfg: Config | None = None) -> pd.DataFrame:
+def bet_log(cfg: Config | None = None, user_id: int | None = None) -> pd.DataFrame:
+    """One user's bets, or every user's when ``user_id`` is None."""
     cfg = cfg or load_config()
     with get_engine(cfg).connect() as conn:
-        df = pd.read_sql(text(BET_LOG_QUERY), conn)
+        df = pd.read_sql(text(BET_LOG_QUERY), conn, params={"user_id": user_id})
     if not df.empty:
         for col in ("placed_at", "settled_at", "kickoff_utc"):
             df[col] = pd.to_datetime(df[col])
     return df
 
 
-def bankroll_history(cfg: Config | None = None) -> pd.DataFrame:
+def bankroll_history(cfg: Config | None = None, user_id: int | None = None) -> pd.DataFrame:
     cfg = cfg or load_config()
+    uid = user_id if user_id is not None else local_user_id(cfg)
     with get_engine(cfg).connect() as conn:
         df = pd.read_sql(
             text("SELECT ts, type, amount, balance_after, bet_id, note "
-                 "FROM bankroll_events ORDER BY ts, id"),
+                 "FROM bankroll_events WHERE user_id = :user_id ORDER BY ts, id"),
             conn,
+            params={"user_id": uid},
         )
     if not df.empty:
         df["ts"] = pd.to_datetime(df["ts"])

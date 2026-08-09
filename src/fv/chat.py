@@ -50,6 +50,11 @@ _WRITE_WORDS = re.compile(
     r"pragma|vacuum|reindex|begin|commit|rollback|savepoint)\b",
     re.I,
 )
+# Tables holding one account's private data. SQL is shared reference data only —
+# matches, odds, xG, predictions, backtests — so that no query, however it is
+# phrased, can read another user's bets, balance, password hash or settings.
+PRIVATE_TABLES = ("bets", "bankroll_events", "users", "user_settings")
+_PRIVATE = re.compile(r"\b(" + "|".join(PRIVATE_TABLES) + r")\b", re.I)
 
 
 def _readonly_connection(cfg: Config) -> sqlite3.Connection:
@@ -87,6 +92,13 @@ def check_query(sql: str) -> str:
         raise QueryError(
             f"'{hit.group(0)}' is not allowed. This tool is read-only: the database "
             "is changed through the app's own pages, never through SQL."
+        )
+    private = _PRIVATE.search(stripped)
+    if private:
+        raise QueryError(
+            f"'{private.group(0)}' holds private per-account data and is not readable "
+            "through SQL. Use my_bets or performance_summary instead — those are scoped "
+            "to the signed-in user."
         )
     return stripped
 
@@ -158,7 +170,7 @@ REFUSED_SETTINGS = {
 }
 
 
-def _validate_setting(key: str, value: Any, cfg: Config) -> Any:
+def _validate_setting(key: str, value: Any, cfg: Config, user_id: int | None) -> Any:
     if key in REFUSED_SETTINGS:
         raise QueryError(REFUSED_SETTINGS[key])
 
@@ -194,7 +206,7 @@ def _validate_setting(key: str, value: Any, cfg: Config) -> Any:
 
     # The odds window has to stay a window. Checked against the value that will be in
     # force after this change, not against config.yaml's default.
-    current = effective_settings(cfg)
+    current = effective_settings(cfg, user_id)
     lo = value if key == "min_odds" else float(current["min_odds"])
     hi = value if key == "max_odds" else float(current["max_odds"])
     if key in ("min_odds", "max_odds") and lo >= hi:
@@ -202,12 +214,14 @@ def _validate_setting(key: str, value: Any, cfg: Config) -> Any:
     return value
 
 
-def update_setting(key: str, value: Any, cfg: Config | None = None) -> dict:
-    """Change one setting, after validating it the way the Settings page would."""
+def update_setting(
+    key: str, value: Any, cfg: Config | None = None, user_id: int | None = None
+) -> dict:
+    """Change one setting for one user, validated the way the Settings page would."""
     cfg = cfg or load_config()
-    old = get_setting(key, effective_settings(cfg).get(key), cfg)
-    new = _validate_setting(key, value, cfg)
-    set_setting(key, new, cfg)
+    old = get_setting(key, effective_settings(cfg, user_id).get(key), cfg, user_id)
+    new = _validate_setting(key, value, cfg, user_id)
+    set_setting(key, new, cfg, user_id)
     return {"key": key, "old_value": old, "new_value": new, "saved": True}
 
 
@@ -215,24 +229,41 @@ def update_setting(key: str, value: Any, cfg: Config | None = None) -> dict:
 # Summaries the database alone cannot answer
 # ---------------------------------------------------------------------------
 
-def settings_summary(cfg: Config | None = None) -> dict:
+def settings_summary(cfg: Config | None = None, user_id: int | None = None) -> dict:
     cfg = cfg or load_config()
-    s = dict(effective_settings(cfg))
-    s["slip_fill_mode"] = bool(get_setting("slip_fill_mode", False, cfg))
-    s["slip_fill_n"] = int(get_setting("slip_fill_n", 10, cfg))
+    s = dict(effective_settings(cfg, user_id))
+    s["slip_fill_mode"] = bool(get_setting("slip_fill_mode", False, cfg, user_id))
+    s["slip_fill_n"] = int(get_setting("slip_fill_n", 10, cfg, user_id))
     return s
 
 
-def performance_summary(cfg: Config | None = None) -> dict:
+def my_bets(limit: int = 50, cfg: Config | None = None, user_id: int | None = None) -> dict:
+    """The signed-in user's own bets. The only route to the bets table."""
+    from fv.bets import bet_log
+
+    log = bet_log(cfg or load_config(), user_id)
+    if log.empty:
+        return {"rows": [], "note": "No bets logged yet."}
+    keep = ["id", "kickoff_utc", "league_code", "home", "away", "selection", "odds_taken",
+            "stake", "mode", "status", "pnl", "closing_odds", "clv"]
+    view = log[keep].head(max(1, min(int(limit), 500)))
+    return {
+        "rows": json.loads(view.to_json(orient="records", date_format="iso")),
+        "total_bets": int(len(log)),
+        "truncated": len(log) > len(view),
+    }
+
+
+def performance_summary(cfg: Config | None = None, user_id: int | None = None) -> dict:
     """Bankroll, the bet log's headline numbers, and the real-money verdict."""
     cfg = cfg or load_config()
     from fv.bets import bet_log, current_bankroll, rolling_roi
 
-    log = bet_log(cfg)
+    log = bet_log(cfg, user_id)
     out: dict[str, Any] = {
-        "bankroll": current_bankroll(cfg),
+        "bankroll": current_bankroll(cfg, user_id),
         "bets_logged": int(len(log)),
-        "paper_mode": bool(effective_settings(cfg)["paper_mode"]),
+        "paper_mode": bool(effective_settings(cfg, user_id)["paper_mode"]),
     }
     if not log.empty:
         settled = log[log["status"].isin(("won", "lost"))]
@@ -258,7 +289,7 @@ def performance_summary(cfg: Config | None = None) -> dict:
                 "quoted from this few bets is noise."
             )
 
-    r = real_money_readiness(cfg)
+    r = real_money_readiness(cfg, user_id=user_id)
     out["readiness"] = {
         "ready_for_real_money": r.ready,
         "backtest_beats_bet365_closing": r.backtest_beats_closing,
@@ -310,17 +341,19 @@ class Tool:
         }
 
 
-def build_tools(cfg: Config) -> dict[str, Tool]:
+def build_tools(cfg: Config, user_id: int | None = None) -> dict[str, Tool]:
     return {
         t.name: t
         for t in [
             Tool(
                 name="run_sql",
                 description=(
-                    "Run a read-only SQL query against the app's SQLite database and get "
-                    "the rows back. SELECT and WITH only; writes are refused by the "
-                    "database itself. Use this for anything about matches, teams, odds, "
-                    "xG, bets, or the bankroll ledger."
+                    "Run a read-only SQL query against the app's shared football data "
+                    "and get the rows back. SELECT and WITH only; writes are refused by "
+                    "the database itself. Covers matches, teams, odds, xG, predictions "
+                    "and backtests. Per-account tables (bets, bankroll_events, users, "
+                    "user_settings) are not readable here — use my_bets or "
+                    "performance_summary for those."
                 ),
                 input_schema={
                     "type": "object",
@@ -351,7 +384,7 @@ def build_tools(cfg: Config) -> dict[str, Tool]:
                     "enabled leagues, and whether paper mode is on."
                 ),
                 input_schema={"type": "object", "properties": {}},
-                fn=lambda: settings_summary(cfg),
+                fn=lambda: settings_summary(cfg, user_id),
             ),
             Tool(
                 name="update_setting",
@@ -372,7 +405,22 @@ def build_tools(cfg: Config) -> dict[str, Tool]:
                     },
                     "required": ["key", "value"],
                 },
-                fn=lambda key, value: update_setting(key, value, cfg),
+                fn=lambda key, value: update_setting(key, value, cfg, user_id),
+            ),
+            Tool(
+                name="my_bets",
+                description=(
+                    "The signed-in user's own bets with status, stake, P&L and CLV. "
+                    "The bets table is not reachable from run_sql, so this is the only "
+                    "way to see them — and it can only ever show this user's."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Default 50, max 500."}
+                    },
+                },
+                fn=lambda limit=50: my_bets(limit, cfg, user_id),
             ),
             Tool(
                 name="performance_summary",
@@ -381,7 +429,7 @@ def build_tools(cfg: Config) -> dict[str, Tool]:
                     "interval, and the real-money readiness verdict with its reasons."
                 ),
                 input_schema={"type": "object", "properties": {}},
-                fn=lambda: performance_summary(cfg),
+                fn=lambda: performance_summary(cfg, user_id),
             ),
             Tool(
                 name="backtest_summary",
@@ -408,9 +456,12 @@ result to the market, strips bet365's margin, and reports edge = probability *
 decimal odds - 1. It suggests a weekly slip. It never places bets; the user places
 them by hand on bet365.
 
-Database tables (use describe_schema for exact columns):
+Shared tables you can query with run_sql (use describe_schema for exact columns):
   leagues, teams, team_aliases, matches, odds, match_xg, model_runs, predictions,
-  backtest_runs, backtest_bets, bets, bankroll_events, settings, ingest_log
+  backtest_runs, backtest_bets, ingest_log
+The user's own bets, balance and settings are private and are NOT in run_sql's
+reach. Use my_bets, performance_summary and get_settings for those. This app has
+several accounts and each one sees only its own.
 Notes: `odds` is long-format, one row per (match, bookmaker, market, selection,
 odds_type); odds_type is 'pre', 'closing' or 'snapshot' and bookmaker 'B365' is
 bet365. `matches` holds both played and scheduled fixtures — status tells you
@@ -489,6 +540,7 @@ def respond(
     cfg: Config | None = None,
     client=None,
     on_tool: Callable[[str, dict], None] | None = None,
+    user_id: int | None = None,
 ) -> Turn:
     """Run one assistant turn to completion, executing tools as they are requested.
 
@@ -496,7 +548,7 @@ def respond(
     caller can keep it in session state and pass it straight back next turn.
     """
     cfg = cfg or load_config()
-    tools = build_tools(cfg)
+    tools = build_tools(cfg, user_id)
     if client is None:
         import anthropic
 

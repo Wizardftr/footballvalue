@@ -510,5 +510,91 @@ def markets(
     console.print(report)
 
 
+@app.command()
+def migrate():
+    """Bring an existing database up to the current schema. Safe to re-run."""
+    from fv.db.migrate import ensure_schema
+
+    notes = ensure_schema(load_config())
+    for note in notes:
+        console.print(f"[green]•[/green] {note}")
+    console.print("[bold]Schema is up to date.[/bold]" if not notes else "[bold]Migrated.[/bold]")
+
+
+user_app = typer.Typer(help="Accounts for the web app. There is no public signup.")
+app.add_typer(user_app, name="user")
+
+
+@user_app.command("add")
+def user_add(
+    email: str = typer.Argument(..., help="Sign-in email."),
+    name: str = typer.Option(None, help="Display name (defaults to the email's local part)."),
+    owner: bool = typer.Option(False, "--owner", help="Can manage other accounts."),
+):
+    """Create an account. The password is prompted for, never passed as an argument."""
+    from fv import auth
+    from fv.db.migrate import ensure_schema
+
+    cfg = load_config()
+    ensure_schema(cfg)
+    password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+    try:
+        account = auth.create_user(email, password, name, "owner" if owner else "member", cfg)
+    except auth.AuthError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+    console.print(f"[green]Created[/green] {account.email} ({account.role}), id {account.id}")
+
+
+@user_app.command("list")
+def user_list():
+    """Show every account."""
+    from fv import auth
+    from rich.table import Table
+
+    rows = auth.list_users(load_config())
+    if not rows:
+        console.print("No accounts yet. Create one with `fv user add you@example.com --owner`.")
+        return
+    table = Table("id", "email", "name", "role", "active", "last seen")
+    for u in rows:
+        table.add_row(
+            str(u["id"]), u["email"], u["display_name"], u["role"],
+            "yes" if u["is_active"] else "no",
+            u["last_login_at"].strftime("%Y-%m-%d %H:%M") if u["last_login_at"] else "-",
+        )
+    console.print(table)
+
+
+@user_app.command("passwd")
+def user_passwd(user_id: int = typer.Argument(..., help="Account id from `fv user list`.")):
+    """Reset an account's password. This is the only password recovery there is."""
+    from fv import auth
+
+    password = typer.prompt("New password", hide_input=True, confirmation_prompt=True)
+    try:
+        auth.set_password(user_id, password, load_config())
+    except auth.AuthError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+    console.print("[green]Password updated.[/green]")
+
+
+@user_app.command("disable")
+def user_disable(
+    user_id: int = typer.Argument(..., help="Account id from `fv user list`."),
+    enable: bool = typer.Option(False, "--enable", help="Re-enable instead."),
+):
+    """Disable (or re-enable) an account without deleting its history."""
+    from fv import auth
+
+    try:
+        auth.set_active(user_id, enable, load_config())
+    except auth.AuthError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+    console.print(f"[green]Account {user_id} {'enabled' if enable else 'disabled'}.[/green]")
+
+
 if __name__ == "__main__":
     app()

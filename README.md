@@ -32,6 +32,8 @@ uv run fv stages                     # all five model stages + comparison table
 uv run fv fixtures                   # upcoming fixtures + bet365 prices
 uv run fv slip --log                 # this week's slip, logged as paper bets
 uv run fv settle                     # auto-settle bets whose results have arrived
+uv run fv migrate                    # bring an older database up to date
+uv run fv user add you@example.com --owner   # create your sign-in account
 uv run fv dashboard                  # Streamlit UI on localhost:8501
 
 uv run fv markets                    # over/under 2.5 backtest + BTTS calibration
@@ -215,14 +217,17 @@ src/fv/
   models/dixon_coles.py   the model
   odds/                   margin, edge, kelly, settlement
   backtest/               walkforward, metrics, report
+  auth.py                 accounts, passwords, sign-in
   chat.py                 the Ask page's tools and its limits
+  db/migrate.py           forward-only schema migrations
   app/dashboard.py        the Streamlit dashboard
+  app/theme.py            palette, wordmark, the legal footer
 tests/
 ```
 
 ## The dashboard
 
-`uv run fv dashboard`. Five pages:
+`uv run fv dashboard`, then sign in. Seven pages:
 
 - **This Week** — fixtures, model vs bet365, edge per selection, the recommended slip
   with stakes, and text/CSV export for placing by hand. It also lists every selection
@@ -235,6 +240,42 @@ tests/
 - **Settings** — bankroll, Kelly fraction, edge threshold, odds range, league toggles,
   stop-loss levels, and the paper/real toggle.
 - **Ask** — an assistant with read-only access to the database (see below).
+- **Account** — your display name, role, and password.
+- **People** — owners only: create, disable and re-enable accounts.
+
+### Accounts
+
+The app is multi-user. It is shared with a handful of people rather than opened to
+the world, so there is **no public signup**: the owner creates each account.
+
+```bash
+uv run fv user add ben@example.com          # prompts for a password
+uv run fv user add ana@example.com --owner  # can also manage accounts
+uv run fv user list
+uv run fv user passwd 3                     # the only password recovery there is
+uv run fv user disable 3                    # keeps their history, revokes access
+```
+
+**What is shared and what is not.** Matches, odds, xG, predictions and backtests
+are facts about football, so every account reads the same ones. Bets, the bankroll
+ledger and settings are personal: each account has its own, and no page, query or
+assistant tool crosses that line. The real-money gate is per-account too — four
+honest weeks of paper trading by one person is not evidence about anybody else.
+
+Global settings act as house defaults; an account inherits them until it sets its
+own value. That is also what a pre-accounts database becomes when it is migrated:
+its settings become the defaults, and its bets and ledger are assigned to the
+owner. `fv migrate` does that, is additive, and is safe to re-run.
+
+The command line has no login — anyone who can run `fv` already has the database.
+It acts as the first owner account, creating a placeholder if none exists yet.
+That placeholder stores an unusable password hash, so it can never be signed into
+from the web.
+
+Sessions live in Streamlit's session state, so refreshing the browser signs you
+out. That is deliberate: a persistent cookie needs a signing secret, rotation and
+a revocation story, none of which is worth building for a group this size. Nothing
+about a login is stored on the device.
 
 ### Ask
 
@@ -252,6 +293,9 @@ What it deliberately cannot do:
 - **Write to the database.** Its SQL connection is opened read-only, so a write is
   refused by SQLite itself. The keyword check is there for a clear error message, not
   as the boundary.
+- **See another account's data.** `bets`, `bankroll_events`, `users` and
+  `user_settings` are unreachable from SQL at all; the only route to them is
+  `my_bets` and `performance_summary`, which are scoped to whoever is signed in.
 - **Place, log, or settle bets.** No tool touches `bets` or `bankroll_events`. Money
   moves only from a page where you are looking at it.
 - **Turn off paper trading.** That toggle sits next to the readiness evidence on
@@ -344,5 +388,9 @@ you measure it honestly instead of hoping.
 - No scraping of bet365 or any bookmaker site. No automated bet placement.
 - Tests are required for all odds maths: margin removal, edge, Kelly, settlement.
 - `.env` holds the Odds API and Anthropic keys and is never committed.
+- Passwords are bcrypt-hashed over a SHA-256 pre-hash, never stored or logged in
+  the clear.
+- Every page carries an 18+ notice, says the backtest does not beat bet365, and
+  links to BeGambleAware. The UI never implies the selections are profitable.
 - The in-app assistant reads; it never writes to the database, never places bets, and
   never turns off paper mode.

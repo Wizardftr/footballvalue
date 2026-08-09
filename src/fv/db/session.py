@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from fv.config import Config, load_config
-from fv.db.models import Base, LeagueRow
+from fv.db.models import LeagueRow
 
 _engines: dict[str, object] = {}
 
@@ -54,8 +54,9 @@ def session_scope(cfg: Config | None = None):
 def init_db(cfg: Config | None = None, echo_path: bool = False) -> Path:
     """Create tables and sync the league reference rows from config.yaml."""
     cfg = cfg or load_config()
-    engine = get_engine(cfg)
-    Base.metadata.create_all(engine)
+    from fv.db.migrate import ensure_schema
+
+    ensure_schema(cfg)
 
     with session_scope(cfg) as s:
         for lg in cfg.leagues:

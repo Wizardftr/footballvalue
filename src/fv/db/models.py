@@ -243,12 +243,55 @@ class BacktestBet(Base):
     clv: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class User(Base):
+    """An account. Accounts are created by the owner; there is no public signup.
+
+    Only *personal* data is scoped to a user: bets, the bankroll ledger, and
+    settings. Matches, odds, xG, predictions and backtests are shared reference
+    data — they are facts about football, not about anybody's account, and
+    duplicating them per user would multiply a 93MB database by the user count for
+    no gain.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(64))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(16), default="member")  # owner | member
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Throttling lives on the row rather than in memory so that restarting the app
+    # does not reset an attacker's budget.
+    failed_logins: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class UserSetting(Base):
+    """Per-user overrides, layered on top of the global ``settings`` table.
+
+    Kept separate from ``settings`` rather than adding a user column to it: the
+    global table keeps working as the house defaults every account inherits, which
+    is also exactly what a single-user database should become when it is migrated.
+    """
+
+    __tablename__ = "user_settings"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Bet(Base):
     """Phase 3: real and paper bets placed manually on bet365."""
 
     __tablename__ = "bets"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     slip_id: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
     match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
     selection: Mapped[str] = mapped_column(String(8))
@@ -271,6 +314,7 @@ class BankrollEvent(Base):
     __tablename__ = "bankroll_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     type: Mapped[str] = mapped_column(String(16))  # deposit|withdrawal|settlement|adjustment
     amount: Mapped[float] = mapped_column(Float)
@@ -280,7 +324,8 @@ class BankrollEvent(Base):
 
 
 class Setting(Base):
-    """UI overrides of config.yaml defaults (Phase 3)."""
+    """Global overrides of config.yaml defaults: the house defaults every account
+    inherits until it sets its own value in ``user_settings``."""
 
     __tablename__ = "settings"
 

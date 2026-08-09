@@ -21,39 +21,59 @@ import numpy as np
 import pandas as pd
 
 from fv.config import PROJECT_ROOT, Config, load_config
-from fv.db.models import Setting
+from fv.db.models import Setting, UserSetting
 from fv.db.session import session_scope
 
 STAGE_REPORT = PROJECT_ROOT / "reports" / "stages" / "stage_comparison.csv"
 PAPER_TRADING_WEEKS_REQUIRED = 4
 
 
-def get_setting(key: str, default=None, cfg: Config | None = None):
-    cfg = cfg or load_config()
-    with session_scope(cfg) as s:
-        row = s.get(Setting, key)
-        if row is None:
-            return default
-        try:
-            return json.loads(row.value_json)
-        except ValueError:
-            return default
+def _decode(row, default):
+    if row is None:
+        return default
+    try:
+        return json.loads(row.value_json)
+    except ValueError:
+        return default
 
 
-def set_setting(key: str, value, cfg: Config | None = None) -> None:
+def get_setting(key: str, default=None, cfg: Config | None = None, user_id: int | None = None):
+    """Resolve a setting: the user's own value, else the house default, else ``default``.
+
+    ``user_id=None`` reads the house default directly, which is what the CLI and the
+    backtest want — they are not acting on anybody's behalf.
+    """
     cfg = cfg or load_config()
     with session_scope(cfg) as s:
-        row = s.get(Setting, key)
-        payload = json.dumps(value)
+        if user_id is not None:
+            mine = s.get(UserSetting, (user_id, key))
+            if mine is not None:
+                return _decode(mine, default)
+        return _decode(s.get(Setting, key), default)
+
+
+def set_setting(key: str, value, cfg: Config | None = None, user_id: int | None = None) -> None:
+    """Store a value for one user, or as the house default when ``user_id`` is None."""
+    cfg = cfg or load_config()
+    payload = json.dumps(value)
+    with session_scope(cfg) as s:
+        if user_id is None:
+            row = s.get(Setting, key)
+            if row is None:
+                s.add(Setting(key=key, value_json=payload, updated_at=datetime.utcnow()))
+            else:
+                row.value_json, row.updated_at = payload, datetime.utcnow()
+            return
+        row = s.get(UserSetting, (user_id, key))
         if row is None:
-            s.add(Setting(key=key, value_json=payload, updated_at=datetime.utcnow()))
+            s.add(UserSetting(user_id=user_id, key=key, value_json=payload,
+                              updated_at=datetime.utcnow()))
         else:
-            row.value_json = payload
-            row.updated_at = datetime.utcnow()
+            row.value_json, row.updated_at = payload, datetime.utcnow()
 
 
-def effective_settings(cfg: Config | None = None) -> dict:
-    """config.yaml defaults with any stored overrides applied."""
+def effective_settings(cfg: Config | None = None, user_id: int | None = None) -> dict:
+    """config.yaml defaults, then the house overrides, then this user's own."""
     cfg = cfg or load_config()
     b, r = cfg.betting, cfg.risk
     defaults = {
@@ -70,7 +90,7 @@ def effective_settings(cfg: Config | None = None) -> dict:
         "enabled_leagues": [lg.code for lg in cfg.enabled_leagues],
     }
     for key in list(defaults):
-        stored = get_setting(key, None, cfg)
+        stored = get_setting(key, None, cfg, user_id)
         if stored is not None:
             defaults[key] = stored
     return defaults
@@ -102,6 +122,7 @@ class Readiness:
 def real_money_readiness(
     cfg: Config | None = None,
     stage_report: Path | None = None,
+    user_id: int | None = None,
 ) -> Readiness:
     """Evaluate the two gates the project set for itself.
 
@@ -141,8 +162,11 @@ def real_money_readiness(
             + (f" (behind by {gap * 1000:.2f} millinats)." if gap is not None else ".")
         )
 
-    # Gate 2: four weeks of paper trading with positive, significant CLV.
-    log = bet_log(cfg)
+    # Gate 2: four weeks of paper trading with positive, significant CLV. Paper
+    # trading is per-account: another user's four honest weeks are not evidence
+    # about this user's discipline, and pooling them would let one account unlock
+    # real money on somebody else's record.
+    log = bet_log(cfg, user_id)
     paper = log[(log["mode"] == "paper") & (log["status"].isin(("won", "lost")))]
     weeks = 0.0
     clv_mean = None

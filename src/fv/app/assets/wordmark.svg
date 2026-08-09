@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 40" width="250" height="40" role="img" aria-label="footballvalue">
+  <circle cx="17" cy="20" r="11" fill="none" stroke="#4FB3A9" stroke-width="2"/>
+  <path d="M17 13.5l5.2 3.8-2 6.1h-6.4l-2-6.1z" fill="#4FB3A9"/>
+  <text x="36" y="26.5" font-family="Inter,Helvetica,Arial,sans-serif" font-size="20" font-weight="700" letter-spacing="-0.5">
+    <tspan fill="#E4EBF2">football</tspan><tspan fill="#4FB3A9">value</tspan>
+  </text>
+</svg>
