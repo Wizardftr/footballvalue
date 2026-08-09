@@ -34,6 +34,10 @@ ui = [
     # installed, every request to the dashboard returns HTTP 500 and the page renders
     # blank. Pin until Streamlit catches up.
     "starlette<1.4",
+    # The Ask page. Installed with the UI so the page never fails on a missing
+    # import; it degrades on a missing ANTHROPIC_API_KEY instead, which is the one
+    # thing the user actually has to supply.
+    "anthropic>=0.40",
 ]
 
 [dependency-groups]

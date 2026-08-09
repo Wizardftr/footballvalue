@@ -1,6 +1,6 @@
 """Streamlit dashboard.
 
-Four pages: This Week, Backtest, Bankroll, Settings.
+Five pages: This Week, Backtest, Bankroll, Settings, Ask.
 
 One rule runs through all of them: never present a number in a way that implies more
 certainty than it has. ROI carries its interval, monthly figures are labelled as
@@ -10,12 +10,14 @@ evidence is against it.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+from fv import chat
 from fv.bets import (
     bankroll_history,
     bet_log,
@@ -544,11 +546,80 @@ def page_settings():
         st.success("Saved. These override config.yaml.")
 
 
+# ---------------------------------------------------------------------------
+# Page 5: Ask
+# ---------------------------------------------------------------------------
+
+def page_ask():
+    st.title("Ask")
+    st.caption(
+        "An assistant with read-only SQL access to this app's database. It can look "
+        "things up and change your thresholds — it cannot place, log or settle bets, "
+        "and it cannot turn off paper trading mode."
+    )
+
+    usable, reason = chat.is_available()
+    if not usable:
+        st.info(reason)
+        return
+
+    if "ask_messages" not in st.session_state:
+        st.session_state.ask_messages = []   # raw API conversation
+        st.session_state.ask_display = []    # what gets drawn, turn by turn
+
+    if st.button("Clear conversation"):
+        st.session_state.ask_messages = []
+        st.session_state.ask_display = []
+        st.rerun()
+
+    for entry in st.session_state.ask_display:
+        with st.chat_message(entry["role"]):
+            if entry.get("tools"):
+                with st.expander(f"{len(entry['tools'])} tool call(s)"):
+                    for call in entry["tools"]:
+                        st.markdown(f"**{call.name}** {'⚠️' if call.error else ''}")
+                        if call.input:
+                            st.code(
+                                call.input.get("sql") or json.dumps(call.input, default=str),
+                                language="sql" if "sql" in call.input else "json",
+                            )
+                        st.caption(str(call.result)[:2000])
+            st.markdown(entry["text"])
+
+    prompt = st.chat_input("Ask about your data, or tell me a setting to change")
+    if not prompt:
+        return
+
+    st.session_state.ask_messages.append({"role": "user", "content": prompt})
+    st.session_state.ask_display.append({"role": "user", "text": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking…"):
+            try:
+                turn = chat.respond(st.session_state.ask_messages)
+            except Exception as exc:
+                # A failed call leaves a dangling user message; drop it so the next
+                # question starts from a valid conversation rather than a 400.
+                st.session_state.ask_messages.pop()
+                st.session_state.ask_display.pop()
+                st.error(f"The assistant call failed: {exc}")
+                return
+        st.session_state.ask_display.append(
+            {"role": "assistant", "text": turn.text, "tools": turn.tool_calls}
+        )
+        if any(c.name == "update_setting" and not c.error for c in turn.tool_calls):
+            st.cache_data.clear()
+        st.rerun()
+
+
 PAGES = {
     "This Week": page_this_week,
     "Backtest": page_backtest,
     "Bankroll": page_bankroll,
     "Settings": page_settings,
+    "Ask": page_ask,
 }
 
 

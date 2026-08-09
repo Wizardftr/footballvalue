@@ -215,12 +215,14 @@ src/fv/
   models/dixon_coles.py   the model
   odds/                   margin, edge, kelly, settlement
   backtest/               walkforward, metrics, report
+  chat.py                 the Ask page's tools and its limits
+  app/dashboard.py        the Streamlit dashboard
 tests/
 ```
 
 ## The dashboard
 
-`uv run fv dashboard`. Four pages:
+`uv run fv dashboard`. Five pages:
 
 - **This Week** — fixtures, model vs bet365, edge per selection, the recommended slip
   with stakes, and text/CSV export for placing by hand. It also lists every selection
@@ -232,6 +234,31 @@ tests/
   its confidence band*, monthly P&L labelled as variance, longest losing streak.
 - **Settings** — bankroll, Kelly fraction, edge threshold, odds range, league toggles,
   stop-loss levels, and the paper/real toggle.
+- **Ask** — an assistant with read-only access to the database (see below).
+
+### Ask
+
+A chat page backed by the Claude API. It can query the database, explain the
+backtest, and change your thresholds. Add `ANTHROPIC_API_KEY=sk-ant-...` to `.env`
+(never committed) and restart the dashboard; without a key the page says so and does
+nothing else.
+
+What it can do: run read-only SQL, read the schema, read settings, read the
+performance and backtest summaries, and change staking/threshold/league settings
+within the same ranges the Settings page allows.
+
+What it deliberately cannot do:
+
+- **Write to the database.** Its SQL connection is opened read-only, so a write is
+  refused by SQLite itself. The keyword check is there for a clear error message, not
+  as the boundary.
+- **Place, log, or settle bets.** No tool touches `bets` or `bankroll_events`. Money
+  moves only from a page where you are looking at it.
+- **Turn off paper trading.** That toggle sits next to the readiness evidence on
+  purpose. An assistant that can be talked into flipping it is not a gate.
+
+Every tool call is shown in the transcript with its exact query and result, so you
+can check the number rather than trust it.
 
 ### The real-money gate
 
@@ -316,4 +343,6 @@ you measure it honestly instead of hoping.
 
 - No scraping of bet365 or any bookmaker site. No automated bet placement.
 - Tests are required for all odds maths: margin removal, edge, Kelly, settlement.
-- `.env` holds the Odds API key and is never committed.
+- `.env` holds the Odds API and Anthropic keys and is never committed.
+- The in-app assistant reads; it never writes to the database, never places bets, and
+  never turns off paper mode.
