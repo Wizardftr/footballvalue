@@ -29,7 +29,7 @@ from fv.models.dixon_coles import fit_dixon_coles
 from fv.models.features import build_features
 from fv.models.lgbm import fit_lgbm
 from fv.odds.edge import Thresholds, edge
-from fv.odds.kelly import StakeRules, stake_for
+from fv.odds.kelly import StakeRules, round_stake, stake_for
 from fv.odds.margin import remove_margin
 
 WEIGHTS_PATH = PROJECT_ROOT / "data" / "tuned_weights.json"
@@ -189,10 +189,24 @@ class Slip:
     # structural fact about those leagues, not a quiet week, and saying "nothing
     # qualified" without saying so would imply next week might differ.
     no_edge_possible_leagues: list[str] = field(default_factory=list)
+    # "value" = only selections clearing the edge threshold. "filled" = the best N by
+    # edge regardless of threshold, so the slip always has something on it.
+    mode: str = "value"
 
     @property
     def total_stake(self) -> float:
         return float(self.selections["stake"].sum()) if not self.selections.empty else 0.0
+
+    @property
+    def expected_return(self) -> float:
+        """Expected profit on the whole slip, by the model's own probabilities.
+
+        Negative means the model itself expects to lose money on these bets. On a
+        filled slip that is the normal case and the number worth looking at.
+        """
+        if self.selections.empty:
+            return 0.0
+        return float((self.selections["stake"] * self.selections["edge"]).sum())
 
 
 def generate_slip(
@@ -200,8 +214,22 @@ def generate_slip(
     bankroll: float | None = None,
     now: datetime | None = None,
     weights_path: Path | None = None,
+    fill_to: int | None = None,
 ) -> Slip:
-    """Build this week's recommended slip."""
+    """Build this week's slip.
+
+    By default only selections clearing the edge threshold appear, so a week with
+    no value produces an empty slip. Passing ``fill_to`` instead takes the best N
+    selections by edge whatever their edge is, which guarantees a slip to place.
+
+    Ranking is by edge rather than by win probability deliberately. Probability
+    ranking would return the shortest-priced favourites every week - the most
+    likely winners and, at a bookmaker's margin, a reliable way to lose money.
+    Edge ranking at least orders selections by where the model disagrees with the
+    price in our favour. When the model has no edge that ordering is mostly noise,
+    which is why a filled slip reports its own negative expected return rather
+    than presenting itself as a set of recommendations.
+    """
     cfg = cfg or load_config()
     b = cfg.betting
     bankroll = bankroll if bankroll is not None else b.get("starting_bankroll", 1000.0)
@@ -277,27 +305,48 @@ def generate_slip(
         return Slip(pd.DataFrame(), all_candidates, bankroll, untuned_leagues=untuned,
                     no_edge_possible_leagues=no_edge)
 
-    qualifying = all_candidates[
-        all_candidates["in_odds_range"]
-        & all_candidates["clears_edge"]
-        & all_candidates["enough_history"]
+    # The odds range and team-history guards always apply: they are about whether
+    # the model has any business having an opinion, not about whether the price is
+    # good. Only the edge threshold is relaxed when filling.
+    eligible = all_candidates[
+        all_candidates["in_odds_range"] & all_candidates["enough_history"]
     ].copy()
+
+    if fill_to:
+        # One selection per match - three outcomes of the same fixture are not three
+        # independent bets, and backing two of them is just paying margin twice.
+        eligible = (
+            eligible.sort_values("edge", ascending=False)
+            .drop_duplicates(subset="match_id", keep="first")
+        )
+        qualifying = eligible.head(fill_to).copy()
+        mode = "filled"
+    else:
+        qualifying = eligible[eligible["clears_edge"]].copy()
+        qualifying = qualifying.sort_values("edge", ascending=False).head(
+            b.get("max_bets_per_week", 8)
+        )
+        mode = "value"
 
     if qualifying.empty:
         return Slip(pd.DataFrame(), all_candidates, bankroll, untuned_leagues=untuned,
-                    no_edge_possible_leagues=no_edge)
-
-    qualifying = qualifying.sort_values("edge", ascending=False).head(
-        b.get("max_bets_per_week", 8)
-    )
-    qualifying["stake"] = [
-        stake_for(r.model_prob, r.odds, bankroll, rules) for r in qualifying.itertuples(index=False)
-    ]
+                    no_edge_possible_leagues=no_edge, mode=mode)
+    if fill_to:
+        # Kelly correctly stakes nothing on a negative edge, so a filled slip has to
+        # use a flat stake. It is capped at the same fraction of bankroll a Kelly bet
+        # would be, so a filled slip can never risk more than a value slip would.
+        flat = round_stake(bankroll * rules.max_stake_pct, rules.rounding)
+        qualifying["stake"] = max(flat, rules.min_stake)
+    else:
+        qualifying["stake"] = [
+            stake_for(r.model_prob, r.odds, bankroll, rules)
+            for r in qualifying.itertuples(index=False)
+        ]
     qualifying = qualifying[qualifying["stake"] > 0]
     qualifying = qualifying.sort_values("kickoff_utc").reset_index(drop=True)
 
     return Slip(qualifying, all_candidates, bankroll, untuned_leagues=untuned,
-                no_edge_possible_leagues=no_edge)
+                no_edge_possible_leagues=no_edge, mode=mode)
 
 
 SELECTION_WORDS = {"H": "Home", "D": "Draw", "A": "Away"}
@@ -329,6 +378,16 @@ def slip_to_text(slip: Slip) -> str:
     lines.append(f"{len(slip.selections)} singles, total stake {slip.total_stake:,.2f}")
     lines.append("SINGLES ONLY - do not combine these into an accumulator.")
     lines.append("")
+    if slip.mode == "filled":
+        ev = slip.expected_return
+        lines.append(f"FILLED SLIP - ranked by edge, edge threshold ignored.")
+        lines.append(f"Expected return by the model's own numbers: {ev:+,.2f}")
+        if ev < 0:
+            pct = ev / slip.total_stake if slip.total_stake else 0.0
+            lines.append(f"That is {pct:+.1%} of stake. The model does not think these")
+            lines.append("are good bets - it thinks they are the least bad ones available.")
+            lines.append("Paper mode is the right place for this until CLV says otherwise.")
+        lines.append("")
     for i, r in enumerate(slip.selections.itertuples(index=False), start=1):
         lines.append(f"{i}. {r.kickoff_utc:%a %d %b %H:%M}  [{r.league_code}]")
         lines.append(f"   {r.home} v {r.away}")

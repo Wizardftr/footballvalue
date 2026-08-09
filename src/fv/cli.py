@@ -331,6 +331,11 @@ def slip(
     log: bool = typer.Option(False, "--log", help="Record the slip as pending bets."),
     real: bool = typer.Option(False, "--real", help="Log as real money instead of paper."),
     out: Path = typer.Option(None, help="Write the slip to a file."),
+    fill: int = typer.Option(
+        None,
+        help="Always return this many selections, ranked by edge, ignoring the edge "
+        "threshold. Guarantees a slip; expect a negative expected return.",
+    ),
 ):
     """Generate this week's recommended slip."""
     from fv.bets import current_bankroll, log_slip
@@ -338,7 +343,7 @@ def slip(
 
     cfg = load_config()
     br = bankroll if bankroll is not None else current_bankroll(cfg)
-    result = generate_slip(cfg, bankroll=br)
+    result = generate_slip(cfg, bankroll=br, fill_to=fill)
     text_slip = slip_to_text(result)
     console.print(text_slip)
 

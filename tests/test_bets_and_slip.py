@@ -301,3 +301,60 @@ def test_paper_mode_defaults_to_on(cfg):
     from fv.settings_store import effective_settings
 
     assert effective_settings(cfg)["paper_mode"] is True
+
+
+# -- filled slips -----------------------------------------------------------
+# Requested feature: always return N selections so there is a slip to place each
+# week. Ranked by edge rather than by win probability - probability ranking returns
+# the shortest-priced favourites, which are the most likely winners and a reliable
+# way to lose money at a bookmaker's margin.
+
+def test_filled_slip_reports_its_own_negative_expected_return():
+    """A filled slip must not present itself as a set of recommendations."""
+    from fv.slip import Slip
+
+    sel = pd.DataFrame({
+        "stake": [20.0, 20.0, 20.0],
+        "edge": [-0.05, -0.06, -0.07],
+    })
+    slip = Slip(sel, pd.DataFrame(), bankroll=1000.0, mode="filled")
+    assert slip.total_stake == pytest.approx(60.0)
+    # 20*(-0.05) + 20*(-0.06) + 20*(-0.07)
+    assert slip.expected_return == pytest.approx(-3.6)
+    assert slip.expected_return < 0
+
+
+def test_expected_return_is_positive_on_a_genuine_value_slip():
+    from fv.slip import Slip
+
+    sel = pd.DataFrame({"stake": [10.0, 10.0], "edge": [0.05, 0.08]})
+    slip = Slip(sel, pd.DataFrame(), bankroll=1000.0, mode="value")
+    assert slip.expected_return == pytest.approx(1.3)
+
+
+def test_slip_text_warns_that_a_filled_slip_is_expected_to_lose():
+    from fv.slip import Slip, slip_to_text
+
+    sel = pd.DataFrame({
+        "kickoff_utc": [pd.Timestamp("2026-08-09 15:00")],
+        "league_code": ["N1"], "home": ["A"], "away": ["B"], "selection": ["H"],
+        "odds": [2.0], "stake": [20.0], "model_prob": [0.45],
+        "market_prob_fair": [0.475], "edge": [-0.10],
+    })
+    text = slip_to_text(Slip(sel, pd.DataFrame(), bankroll=1000.0, mode="filled"))
+    assert "FILLED SLIP" in text
+    assert "Expected return" in text
+    assert "least bad" in text
+
+
+def test_a_value_slip_carries_no_filled_warning():
+    from fv.slip import Slip, slip_to_text
+
+    sel = pd.DataFrame({
+        "kickoff_utc": [pd.Timestamp("2026-08-09 15:00")],
+        "league_code": ["E0"], "home": ["A"], "away": ["B"], "selection": ["H"],
+        "odds": [2.0], "stake": [20.0], "model_prob": [0.55],
+        "market_prob_fair": [0.50], "edge": [0.10],
+    })
+    text = slip_to_text(Slip(sel, pd.DataFrame(), bankroll=1000.0, mode="value"))
+    assert "FILLED SLIP" not in text

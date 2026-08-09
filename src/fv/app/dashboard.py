@@ -27,7 +27,12 @@ from fv.bets import (
     settle_pending,
 )
 from fv.config import PROJECT_ROOT, load_config
-from fv.settings_store import effective_settings, real_money_readiness, set_setting
+from fv.settings_store import (
+    effective_settings,
+    get_setting,
+    real_money_readiness,
+    set_setting,
+)
 from fv.slip import generate_slip, slip_to_csv, slip_to_text
 
 st.set_page_config(page_title="footballvalue", page_icon="⚽", layout="wide")
@@ -75,8 +80,25 @@ def page_this_week():
     if not settings["paper_mode"]:
         _readiness_banner()
 
+    c1, c2 = st.columns([1, 3])
+    fill_mode = c1.toggle(
+        "Always give me a slip",
+        value=bool(get_setting("slip_fill_mode", False)),
+        help="Off: only selections that clear the edge threshold, so a week with no "
+             "value gives an empty slip. On: the best N by edge regardless, so there "
+             "is always something to place.",
+    )
+    fill_n = None
+    if fill_mode:
+        fill_n = int(c2.slider("Selections per week", 1, 20,
+                               int(get_setting("slip_fill_n", 10))))
+        set_setting("slip_fill_mode", True)
+        set_setting("slip_fill_n", fill_n)
+    else:
+        set_setting("slip_fill_mode", False)
+
     with st.spinner("Fitting models and pricing fixtures…"):
-        slip = generate_slip(bankroll=bankroll)
+        slip = generate_slip(bankroll=bankroll, fill_to=fill_n)
 
     if slip.untuned_leagues:
         st.warning(
@@ -109,6 +131,19 @@ def page_this_week():
             "not a failure — a week with nothing worth backing is a normal outcome."
         )
     else:
+        if slip.mode == "filled":
+            ev = slip.expected_return
+            pct = ev / slip.total_stake if slip.total_stake else 0.0
+            if ev < 0:
+                st.warning(
+                    f"**Filled slip — expected return {ev:+,.2f} ({pct:+.1%} of stake).** "
+                    "Ranked by edge with the threshold switched off, so these are the "
+                    "least-bad selections available, not good ones. The model expects "
+                    "them to lose. Keep this in paper mode until four weeks of CLV say "
+                    "otherwise."
+                )
+            else:
+                st.success(f"Filled slip — expected return {ev:+,.2f} ({pct:+.1%} of stake).")
         st.caption("**Singles only.** Never combine these into an accumulator: doing so "
                    "multiplies the bookmaker's margin.")
         display = slip.selections.copy()
