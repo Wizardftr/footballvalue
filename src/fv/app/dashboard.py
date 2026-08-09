@@ -1,24 +1,31 @@
-"""Streamlit dashboard.
+"""The app.
 
-Five pages: This Week, Backtest, Bankroll, Settings, Ask.
+Six pages, and only one of them is the point: **This week** tells you what to put
+on. Everything else exists to answer "should I trust it?" and "how am I doing?".
 
-One rule runs through all of them: never present a number in a way that implies more
-certainty than it has. ROI carries its interval, monthly figures are labelled as
-variance, and the real-money toggle shows the evidence against itself when the
-evidence is against it.
+Two rules run through all of it.
+
+*Plain words.* Nothing on screen assumes the reader has heard of Kelly staking or
+closing line value. Where an honest sentence needs a technical idea, the idea gets
+explained instead of named. The vocabulary lives in ``plain.py``.
+
+*Never imply more certainty than there is.* Returns carry their range, a month is
+labelled as luck, and the real-money switch shows the evidence against itself when
+the evidence is against it. Simplifying the language must never simplify away the
+part the reader would rather not hear.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from fv import auth, chat
-from fv.app import theme
+from fv.app import plain, theme
 from fv.bets import (
     bankroll_history,
     bet_log,
@@ -30,13 +37,13 @@ from fv.bets import (
     settle_pending,
 )
 from fv.config import PROJECT_ROOT, load_config
+from fv.db.migrate import ensure_schema
 from fv.settings_store import (
     effective_settings,
     get_setting,
     real_money_readiness,
     set_setting,
 )
-from fv.db.migrate import ensure_schema
 from fv.slip import generate_slip, slip_to_csv, slip_to_text
 
 st.set_page_config(
@@ -46,11 +53,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-SELECTION_WORDS = {"H": "Home", "D": "Draw", "A": "Away"}
-
 
 def _uid() -> int:
-    """The signed-in account's id. Every page runs behind the sign-in gate."""
+    """The signed-in account. Every page runs behind the sign-in gate."""
     return st.session_state.account.id
 
 
@@ -58,530 +63,593 @@ def _account():
     return st.session_state.account
 
 
-def _pct(x, digits=2):
+def _money(x: float) -> str:
+    return f"€{x:,.2f}"
+
+
+def _pct(x, digits=1, signed=True):
     if x is None or (isinstance(x, float) and not np.isfinite(x)):
         return "n/a"
-    return f"{x * 100:+.{digits}f}%"
+    return f"{x * 100:{'+' if signed else ''}.{digits}f}%"
 
 
 @st.cache_data(ttl=300)
 def _cached_bet_log(user_id: int):
     """Keyed on the user id on purpose: an unkeyed cache would hand one account
-    another account's bet log for five minutes."""
+    another account's history for five minutes."""
     return bet_log(user_id=user_id)
 
 
-def _readiness_banner():
-    """The honest verdict, shown wherever real money could be a temptation."""
-    r = real_money_readiness(user_id=_uid())
-    if r.ready:
-        st.success(f"**{r.headline}**")
-        return r
-    st.error(f"**{r.headline}**")
-    for reason in r.reasons:
-        st.caption(f"• {reason}")
-    return r
+def _league_names() -> dict[str, str]:
+    return {lg.code: lg.name for lg in load_config().leagues}
+
+
+def glossary():
+    with st.expander("What do these words mean?"):
+        for term, meaning in plain.GLOSSARY:
+            st.markdown(f"**{term}** — {meaning}")
 
 
 # ---------------------------------------------------------------------------
-# Page 1: This Week
+# This week
 # ---------------------------------------------------------------------------
 
 def page_this_week():
-    theme.hero("This Week",
-               "Fixtures the model has priced, what it disagrees with bet365 about, "
-               "and the slip that follows from your thresholds.")
     settings = effective_settings(user_id=_uid())
-    bankroll = current_bankroll(user_id=_uid())
+    balance = current_bankroll(user_id=_uid())
+    names = _league_names()
+    practice = bool(settings["paper_mode"])
+
+    theme.hero(
+        "This week",
+        "Your picks, ready to place by hand at the bookmaker. One bet per match.",
+    )
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Bankroll", f"{bankroll:,.2f}")
-    c2.metric("Mode", "Paper" if settings["paper_mode"] else "REAL MONEY")
-    c3.metric("Edge threshold", f"{settings['min_edge']:.0%}")
+    theme.card("Your balance", _money(balance), container=c1)
+    theme.card("Mode", "Practice" if practice else "REAL MONEY",
+               "No real money involved" if practice else "You are staking real money",
+               tone="" if practice else "bad", container=c2)
 
-    if not settings["paper_mode"]:
-        _readiness_banner()
+    # How many picks, in one control instead of three.
+    always = bool(get_setting("slip_fill_mode", True, user_id=_uid()))
+    how_many = int(get_setting("slip_fill_n", 10, user_id=_uid()))
+    theme.card("Picks this week", str(how_many) if always else "Only when worth it",
+               container=c3)
 
-    c1, c2 = st.columns([1, 3])
-    fill_mode = c1.toggle(
-        "Always give me a slip",
-        value=bool(get_setting("slip_fill_mode", False, user_id=_uid())),
-        help="Off: only selections that clear the edge threshold, so a week with no "
-             "value gives an empty slip. On: the best N by edge regardless, so there "
-             "is always something to place.",
-    )
-    fill_n = None
-    if fill_mode:
-        fill_n = int(c2.slider("Selections per week", 1, 20,
-                               int(get_setting("slip_fill_n", 10, user_id=_uid()))))
-        set_setting("slip_fill_mode", True, user_id=_uid())
-        set_setting("slip_fill_n", fill_n, user_id=_uid())
-    else:
-        set_setting("slip_fill_mode", False, user_id=_uid())
-
-    with st.spinner("Fitting models and pricing fixtures…"):
-        slip = generate_slip(bankroll=bankroll, fill_to=fill_n)
-
-    if slip.untuned_leagues:
-        st.warning(
-            f"No tuned weights for {', '.join(slip.untuned_leagues)} — using config "
-            "defaults. Run `fv stages` so these leagues use validated weights."
+    rank_by = str(get_setting("rank_by", "value", user_id=_uid()))
+    with st.expander("Change what you get"):
+        choice = st.radio(
+            "Every week…",
+            ["Give me my best picks", "Only give me picks that look genuinely worth it"],
+            index=0 if always else 1,
+            help="The second option is stricter and will often give you nothing at "
+                 "all. A week with no bets is a normal outcome, not a fault.",
         )
+        always = choice.startswith("Give me")
+        if always:
+            how_many = int(st.slider("How many picks", 1, 20, how_many))
+            set_setting("slip_fill_n", how_many, user_id=_uid())
+        set_setting("slip_fill_mode", always, user_id=_uid())
 
-    if slip.no_edge_possible_leagues:
-        st.error(
-            f"**{', '.join(slip.no_edge_possible_leagues)}: no selection can qualify.** "
-            "Validation gave the market a weight of 1.0 in these leagues, so the "
-            "anchored probability *is* the market's own price and every edge equals "
-            "minus the bookmaker's margin. This is structural, not a quiet week — "
-            "these leagues cannot produce a bet until the model earns weight back "
-            "against the market."
+        order = st.radio(
+            "Put in order by",
+            ["Best value", "Most likely to win"],
+            index=0 if rank_by == "value" else 1,
+            help="Most likely to win gives you shorter odds, so more of them come in "
+                 "— but each one pays less, and it is not a better bet. The expected "
+                 "profit shown below tells you the truth either way.",
         )
+        rank_by = "value" if order == "Best value" else "likely"
+        set_setting("rank_by", rank_by, user_id=_uid())
+
+    with st.spinner("Working out this week's prices…"):
+        slip = generate_slip(bankroll=balance, fill_to=how_many if always else None,
+                             rank_by=rank_by)
 
     if slip.all_candidates.empty:
         st.info(
-            "**No upcoming fixtures with prices.** football-data.co.uk publishes "
-            "fixtures about a week ahead, and only once a season is under way. Run "
-            "`fv fixtures` to refresh."
+            "**No matches to price yet.** Fixtures appear about a week ahead, and only "
+            "once the season is under way. Check back in a day or two."
         )
+        glossary()
         return
 
-    st.subheader("Recommended slip")
     if slip.selections.empty:
         st.info(
-            "**Nothing qualifies this week.** That is the thresholds doing their job, "
-            "not a failure — a week with nothing worth backing is a normal outcome."
+            "**Nothing worth backing this week.** That is the filter doing its job. "
+            "A quiet week is normal — switch on *Give me my best picks* above if you "
+            "would rather always have something."
         )
-    else:
-        if slip.mode == "filled":
-            ev = slip.expected_return
-            pct = ev / slip.total_stake if slip.total_stake else 0.0
-            if ev < 0:
-                st.warning(
-                    f"**Filled slip — expected return {ev:+,.2f} ({pct:+.1%} of stake).** "
-                    "Ranked by edge with the threshold switched off, so these are the "
-                    "least-bad selections available, not good ones. The model expects "
-                    "them to lose. Keep this in paper mode until four weeks of CLV say "
-                    "otherwise."
-                )
-            else:
-                st.success(f"Filled slip — expected return {ev:+,.2f} ({pct:+.1%} of stake).")
-        st.caption("**Singles only.** Never combine these into an accumulator: doing so "
-                   "multiplies the bookmaker's margin.")
-        display = slip.selections.copy()
-        display["match"] = display["home"] + " v " + display["away"]
-        display["pick"] = display["selection"].map(SELECTION_WORDS)
-        # Streamlit's "%.1f%%" is a printf format: it appends a percent sign but does
-        # not multiply by 100. These columns hold fractions, so they must be scaled
-        # here or every probability renders 100x too small.
-        for col in ("model_prob", "market_prob_fair", "edge"):
-            display[col] = display[col] * 100.0
-        st.dataframe(
-            display[["kickoff_utc", "league_code", "match", "pick", "odds", "stake",
-                     "model_prob", "market_prob_fair", "edge"]].rename(columns={
-                "kickoff_utc": "kickoff", "league_code": "league",
-                "model_prob": "model", "market_prob_fair": "market",
-            }),
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "model": st.column_config.NumberColumn(format="%.1f%%"),
-                "market": st.column_config.NumberColumn(format="%.1f%%"),
-                "edge": st.column_config.NumberColumn(format="%+.1f%%"),
-                "odds": st.column_config.NumberColumn(format="%.2f"),
-                "stake": st.column_config.NumberColumn(format="%.2f"),
-            },
+        _why_not_table(slip, names)
+        glossary()
+        return
+
+    # The honest health warning, in plain words, before the table rather than after.
+    if slip.mode == "filled" and slip.expected_return < 0:
+        st.warning(
+            f"**These are the best available, not good ones.** The model expects this "
+            f"list to lose about {_money(abs(slip.expected_return))} of the "
+            f"{_money(slip.total_stake)} staked. You asked for {how_many} picks every "
+            "week, so it gave you the least-bad {n}. Keep this in practice mode."
+            .replace("{n}", str(len(slip.selections)))
         )
-        st.caption(f"{len(slip.selections)} selections, total stake {slip.total_stake:,.2f} "
-                   f"({slip.total_stake / bankroll:.1%} of bankroll)")
 
-        c1, c2, c3 = st.columns([1, 1, 2])
-        c1.download_button("Download .txt", slip_to_text(slip),
-                           file_name=f"slip-{datetime.utcnow():%Y%m%d}.txt")
-        c2.download_button("Download .csv", slip_to_csv(slip),
-                           file_name=f"slip-{datetime.utcnow():%Y%m%d}.csv")
-        mode = "paper" if settings["paper_mode"] else "real"
-        if c3.button(f"Log these {len(slip.selections)} bets as {mode}", type="primary"):
-            slip_id, n = log_slip(slip.selections, mode=mode, user_id=_uid())
-            st.cache_data.clear()
-            st.success(f"Logged {n} bets as {slip_id}.")
+    st.subheader(f"Your {len(slip.selections)} picks")
+    st.caption(f"Total to stake: **{_money(slip.total_stake)}** — "
+               f"{slip.total_stake / balance:.0%} of your balance. "
+               "**Place these as separate bets.** Never combine them into one.")
 
-        with st.expander("Slip as text"):
-            st.code(slip_to_text(slip), language=None)
+    table = slip.selections.copy()
+    table["Match"] = table["home"] + "  v  " + table["away"]
+    table["Bet on"] = table["selection"].map(plain.PICK_WORDS)
+    table["Market"] = table["market"].map(plain.MARKET_WORDS).fillna(table["market"])
+    table["League"] = table["league_code"].map(names).fillna(table["league_code"])
+    table["Kick-off"] = pd.to_datetime(table["kickoff_utc"]).dt.strftime("%a %d %b, %H:%M")
+    table["Stake"] = table["stake"]
+    table["Odds"] = table["odds"]
+    table["Returns"] = table["stake"] * table["odds"]
 
-    st.subheader("All fixtures and edges")
-    st.caption("Every selection considered, including those that did not qualify. "
-               "Useful for seeing *why* something was left out.")
-    cand = slip.all_candidates.copy()
-    cand["match"] = cand["home"] + " v " + cand["away"]
-    cand["pick"] = cand["selection"].map(SELECTION_WORDS)
-    cand["qualified"] = cand["in_odds_range"] & cand["clears_edge"] & cand["enough_history"]
-
-    def why_not(r):
-        if r.qualified:
-            return "qualified"
-        bits = []
-        if not r.in_odds_range:
-            bits.append("odds outside range")
-        if not r.clears_edge:
-            bits.append("edge below threshold")
-        if not r.enough_history:
-            bits.append("too little team history")
-        return "; ".join(bits)
-
-    cand["reason"] = [why_not(r) for r in cand.itertuples(index=False)]
-    for col in ("model_prob", "market_prob_fair", "edge"):
-        cand[col] = cand[col] * 100.0
-    leagues = sorted(cand["league_code"].unique())
-    chosen = st.multiselect("Leagues", leagues, default=leagues)
-    view = cand[cand["league_code"].isin(chosen)].sort_values("edge", ascending=False)
     st.dataframe(
-        view[["kickoff_utc", "league_code", "match", "pick", "odds",
-              "model_prob", "market_prob_fair", "edge", "reason"]].rename(columns={
-            "kickoff_utc": "kickoff", "league_code": "league",
-            "model_prob": "model", "market_prob_fair": "market"}),
+        table[["Kick-off", "League", "Match", "Market", "Bet on", "Odds", "Stake",
+               "Returns"]],
         hide_index=True, use_container_width=True,
         column_config={
-            "model": st.column_config.NumberColumn(format="%.1f%%"),
-            "market": st.column_config.NumberColumn(format="%.1f%%"),
-            "edge": st.column_config.NumberColumn(format="%+.1f%%"),
-            "odds": st.column_config.NumberColumn(format="%.2f"),
+            "Odds": st.column_config.NumberColumn(format="%.2f"),
+            "Stake": st.column_config.NumberColumn(format="€%.2f"),
+            "Returns": st.column_config.NumberColumn(
+                "Returns if it wins", format="€%.2f",
+                help="Your stake back plus the profit."),
         },
     )
 
+    c1, c2, c3 = st.columns([1, 1, 2])
+    c1.download_button("Save as text", slip_to_text(slip),
+                       file_name=f"picks-{datetime.utcnow():%Y-%m-%d}.txt",
+                       use_container_width=True)
+    c2.download_button("Save as spreadsheet", slip_to_csv(slip),
+                       file_name=f"picks-{datetime.utcnow():%Y-%m-%d}.csv",
+                       use_container_width=True)
+    label = ("Save these to my history" if practice
+             else "Save these as REAL bets")
+    if c3.button(label, type="primary", use_container_width=True):
+        slip_id, n = log_slip(slip.selections, mode="paper" if practice else "real",
+                              user_id=_uid())
+        st.cache_data.clear()
+        st.success(f"Saved {n} picks. Results fill in automatically as matches finish.")
 
-# ---------------------------------------------------------------------------
-# Page 2: Backtest
-# ---------------------------------------------------------------------------
-
-def page_backtest():
-    theme.hero("Backtest",
-               "Walk-forward results on held-out seasons, priced against bet365's own "
-               "closing odds. This is the evidence the real-money gate reads.")
-    stages_dir = PROJECT_ROOT / "reports" / "stages"
-    flat_dir = PROJECT_ROOT / "reports" / "flat"
-
-    stage_csv = stages_dir / "stage_comparison.csv"
-    if stage_csv.exists():
-        st.subheader("Stage-by-stage comparison")
-        table = pd.read_csv(stage_csv)
-        for col in ("roi", "roi_lo", "roi_hi", "clv_mean"):
-            if col in table.columns:
-                table[col] = table[col] * 100.0
+    with st.expander("Why these matches?"):
+        st.caption(
+            "A match only appears when the model thinks a result is more likely than "
+            "the bookmaker's price suggests. The two columns below are those two "
+            "opinions side by side."
+        )
+        detail = slip.selections.copy()
+        detail["Match"] = detail["home"] + " v " + detail["away"]
+        detail["Bet on"] = detail["selection"].map(plain.PICK_WORDS)
+        if (detail["model_prob"] - detail["market_prob_fair"]).abs().max() < 1e-9:
+            st.warning(
+                "**In these leagues the two columns are identical, and that is the "
+                "honest answer.** Testing showed the model added nothing to the "
+                "bookmaker's price here, so it was told to use the price as-is. "
+                "These picks are the bookmaker's own opinion, sorted — not an "
+                "insight of ours."
+            )
+        for col in ("model_prob", "market_prob_fair", "edge"):
+            detail[col] = detail[col] * 100.0
         st.dataframe(
-            table[["stage", "n", "log_loss", "brier", "bets", "roi", "roi_lo",
-                   "roi_hi", "clv_mean", "clv_significant"]],
+            detail[["Match", "Bet on", "odds", "model_prob", "market_prob_fair", "edge"]]
+            .rename(columns={"odds": "Odds", "model_prob": "Our chance",
+                             "market_prob_fair": "Their chance", "edge": "Value"}),
             hide_index=True, use_container_width=True,
             column_config={
-                "roi": st.column_config.NumberColumn(format="%.2f%%"),
-                "roi_lo": st.column_config.NumberColumn("ROI low", format="%.2f%%"),
-                "roi_hi": st.column_config.NumberColumn("ROI high", format="%.2f%%"),
-                "clv_mean": st.column_config.NumberColumn("CLV", format="%.3f%%"),
+                "Odds": st.column_config.NumberColumn(format="%.2f"),
+                "Our chance": st.column_config.NumberColumn(format="%.0f%%"),
+                "Their chance": st.column_config.NumberColumn(
+                    format="%.0f%%", help="The bookmaker's price, with their cut removed."),
+                "Value": st.column_config.NumberColumn(
+                    format="%+.1f%%", help="How much better than the price the model "
+                                           "thinks this is. Negative means worse."),
             },
         )
-        md = stages_dir / "stage_comparison.md"
-        if md.exists():
-            with st.expander("Full report"):
-                st.markdown(md.read_text())
-    else:
-        st.info("No stage comparison yet. Run `fv stages`.")
 
-    bets_csv = flat_dir / "bets.csv"
-    if not bets_csv.exists():
-        st.info("No backtest bet log yet. Run `fv backtest --flat-stake 10`.")
-        return
+    _why_not_table(slip, names)
+    glossary()
 
-    bets = pd.read_csv(bets_csv, parse_dates=["kickoff_utc"])
-    st.subheader("Cumulative P&L")
-    curve = bets.sort_values("kickoff_utc").copy()
-    curve["cumulative"] = curve["pnl"].cumsum()
-    st.line_chart(curve.set_index("kickoff_utc")["cumulative"])
 
-    st.subheader("Drawdown")
-    peak = curve["cumulative"].cummax()
-    curve["drawdown"] = curve["cumulative"] - peak
-    st.area_chart(curve.set_index("kickoff_utc")["drawdown"])
+def _why_not_table(slip, names):
+    """Everything considered and left out, with a reason a person can act on."""
+    if slip.no_edge_possible_leagues:
+        left_out = ", ".join(names.get(c, c) for c in slip.no_edge_possible_leagues)
+        st.warning(
+            f"**{left_out} will never produce a pick.** In these leagues the model has "
+            "not shown it can price matches better than the bookmaker, so testing told "
+            "it to simply copy the bookmaker's price — and copying the price always "
+            "loses by the size of the bookmaker's cut. This is honest, not broken."
+        )
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("ROI by league")
-        by_league = bets.groupby("league_code").apply(
-            lambda g: pd.Series(
-                {"bets": len(g), "roi": 100.0 * g["pnl"].sum() / g["stake"].sum()}
-            ),
-            include_groups=False,
-        ).reset_index()
-        st.dataframe(by_league, hide_index=True, use_container_width=True,
-                     column_config={"roi": st.column_config.NumberColumn(format="%.2f%%")})
-    with c2:
-        st.subheader("ROI by season")
-        by_season = bets.groupby("season").apply(
-            lambda g: pd.Series(
-                {"bets": len(g), "roi": 100.0 * g["pnl"].sum() / g["stake"].sum()}
-            ),
-            include_groups=False,
-        ).reset_index()
-        st.dataframe(by_season, hide_index=True, use_container_width=True,
-                     column_config={"roi": st.column_config.NumberColumn(format="%.2f%%")})
+    with st.expander("Every match we looked at"):
+        cand = slip.all_candidates.copy()
+        cand["Match"] = cand["home"] + " v " + cand["away"]
+        cand["Bet on"] = cand["selection"].map(plain.PICK_WORDS)
+        cand["League"] = cand["league_code"].map(names).fillna(cand["league_code"])
+        cand["Market"] = cand["market"].map(plain.MARKET_WORDS).fillna(cand["market"])
+        qualified = cand["in_odds_range"] & cand["clears_edge"] & cand["enough_history"]
 
-    markets_dir = PROJECT_ROOT / "reports" / "markets"
-    if (markets_dir / "markets_report.md").exists():
-        st.subheader("Other markets")
-        st.caption("Over/under 2.5 has real bet365 prices and a real backtest. "
-                   "**BTTS has no historical prices anywhere free, so it is not "
-                   "validated** — the model produces a probability, but nothing "
-                   "measures whether it beats a price.")
-        with st.expander("Over/under 2.5 and BTTS report"):
-            st.markdown((markets_dir / "markets_report.md").read_text())
+        def why(r, ok):
+            if ok:
+                return "On your list"
+            bits = []
+            if not r.in_odds_range:
+                bits.append("odds outside your range")
+            if not r.clears_edge:
+                bits.append("not enough value")
+            if not r.enough_history:
+                bits.append("too little history on these teams")
+            return "; ".join(bits)
 
-    st.subheader("CLV distribution")
-    clv = bets["clv"].dropna()
-    if clv.empty:
-        st.caption("No closing prices in this window — CLV is unmeasurable before 2019-20.")
-    else:
-        counts, edges = np.histogram(clv, bins=40)
-        st.bar_chart(pd.DataFrame({"count": counts},
-                                  index=np.round((edges[:-1] + edges[1:]) / 2, 4)))
-        se = clv.std(ddof=1) / np.sqrt(len(clv))
-        lo, hi = clv.mean() - 1.96 * se, clv.mean() + 1.96 * se
-        st.caption(
-            f"Mean {_pct(clv.mean())} (95% CI [{_pct(lo)}, {_pct(hi)}]), "
-            f"beat the close on {(clv > 0).mean():.1%} of {len(clv):,} bets."
-            + ("" if lo > 0 or hi < 0 else
-               "  **The interval spans zero: this is not evidence of an edge.**")
+        cand["Why not"] = [why(r, ok) for r, ok in
+                           zip(cand.itertuples(index=False), qualified, strict=True)]
+        cand["Value"] = cand["edge"] * 100.0
+        chosen = st.multiselect("Leagues", sorted(cand["League"].unique()),
+                                default=sorted(cand["League"].unique()))
+        view = cand[cand["League"].isin(chosen)].sort_values("edge", ascending=False)
+        st.dataframe(
+            view[["League", "Match", "Market", "Bet on", "odds", "Value", "Why not"]]
+            .rename(columns={"odds": "Odds"}),
+            hide_index=True, use_container_width=True,
+            column_config={
+                "Odds": st.column_config.NumberColumn(format="%.2f"),
+                "Value": st.column_config.NumberColumn(format="%+.1f%%"),
+            },
         )
 
 
 # ---------------------------------------------------------------------------
-# Page 3: Bankroll
+# Track record
 # ---------------------------------------------------------------------------
 
-def page_bankroll():
-    theme.hero("Bankroll",
-               "Your balance, your bets, and how they are actually doing — judged on "
-               "the rolling window and CLV, never on a single month.")
+def page_track_record():
+    theme.hero(
+        "Track record",
+        "How the model would have done on seasons it had never seen. This is the "
+        "evidence for or against trusting it with real money.",
+    )
+
+    stages_csv = PROJECT_ROOT / "reports" / "stages" / "stage_comparison.csv"
+    if not stages_csv.exists():
+        st.info("No test results yet. Ask whoever set this up to run the season test.")
+        return
+
+    table = pd.read_csv(stages_csv)
+    r = real_money_readiness(user_id=_uid())
+    best = table.sort_values("log_loss").iloc[0]
+
+    if r.backtest_beats_closing:
+        st.success("**In testing, the model priced matches better than the bookmaker.**")
+    else:
+        st.error(
+            "**In testing, the model did not price matches better than the "
+            "bookmaker.** Everything else on this page follows from that. It is why "
+            "the app stays in practice mode, and it is not something a good few weeks "
+            "can overturn."
+        )
+
+    c1, c2, c3 = st.columns(3)
+    roi = float(best["roi"])
+    lo, hi = float(best["roi_lo"]), float(best["roi_hi"])
+    theme.card(
+        "Return in testing", _pct(roi),
+        f"From {int(best['bets']):,} bets — and anywhere between {_pct(lo)} and "
+        f"{_pct(hi)} would have looked the same. The range is the honest answer.",
+        tone="bad" if hi < 0 else "warn", container=c1,
+    )
+    theme.card("Matches priced", f"{int(best['n']):,}",
+               "Every one on a season the model had never seen.", container=c2)
+    theme.card("Beat the closing price?",
+               "Yes" if bool(best["clv_significant"]) else "No",
+               "Regularly taking a better price than the bookmaker's final one is the "
+               "earliest sign of a real advantage. There isn't one here.",
+               tone="bad" if not bool(best["clv_significant"]) else "accent",
+               container=c3)
+
+    st.subheader("What each version of the model achieved")
+    st.caption("Each row adds something to the one above it. More complicated did not "
+               "turn out to mean better.")
+    # The bookmaker's own score, backed out of the gap the readiness gate computed for
+    # the best stage. Comparing each row against it is what turns a log-loss column
+    # nobody can read into a yes/no anybody can.
+    market_ll = (float(best["log_loss"]) - r.backtest_gap
+                 if r.backtest_gap is not None else None)
+    show = table.copy()
+    show["Version"] = show["stage"].map(plain.STAGE_NAMES).fillna(show["stage"])
+    show["Return"] = show["roi"] * 100.0
+    show["Better than the bookmaker"] = (
+        show["log_loss"] < market_ll if market_ll is not None else False
+    )
+    st.dataframe(
+        show[["Version", "bets", "Return", "Better than the bookmaker"]]
+        .rename(columns={"bets": "Bets"}),
+        hide_index=True, use_container_width=True,
+        column_config={"Return": st.column_config.NumberColumn(format="%+.2f%%")},
+    )
+
+    flat = PROJECT_ROOT / "reports" / "flat" / "bets.csv"
+    if flat.exists():
+        bets = pd.read_csv(flat, parse_dates=["kickoff_utc"])
+        st.subheader("How a €10 bet on every pick would have gone")
+        curve = bets.sort_values("kickoff_utc").copy()
+        curve["Running profit (€)"] = curve["pnl"].cumsum()
+        st.line_chart(curve.set_index("kickoff_utc")["Running profit (€)"])
+        worst = (curve["Running profit (€)"] - curve["Running profit (€)"].cummax()).min()
+        st.caption(
+            f"Worst losing run: **{_money(abs(worst))}** below the best point it had "
+            "reached. Any real betting plan has to survive a stretch like that."
+        )
+
+        with st.expander("More detail"):
+            st.caption("By league and by season, same €10 bets.")
+            c1, c2 = st.columns(2)
+            names = _league_names()
+            by_league = bets.groupby("league_code").apply(
+                lambda g: pd.Series({"Bets": len(g),
+                                     "Return": 100.0 * g["pnl"].sum() / g["stake"].sum()}),
+                include_groups=False).reset_index()
+            by_league["League"] = by_league["league_code"].map(names)
+            c1.dataframe(by_league[["League", "Bets", "Return"]], hide_index=True,
+                         use_container_width=True,
+                         column_config={"Return": st.column_config.NumberColumn(
+                             format="%+.2f%%")})
+            by_season = bets.groupby("season").apply(
+                lambda g: pd.Series({"Bets": len(g),
+                                     "Return": 100.0 * g["pnl"].sum() / g["stake"].sum()}),
+                include_groups=False).reset_index()
+            c2.dataframe(by_season.rename(columns={"season": "Season"}), hide_index=True,
+                         use_container_width=True,
+                         column_config={"Return": st.column_config.NumberColumn(
+                             format="%+.2f%%")})
+
+    md = stages_csv.with_suffix(".md")
+    if md.exists():
+        with st.expander("The full technical report"):
+            st.markdown(md.read_text())
+    glossary()
+
+
+# ---------------------------------------------------------------------------
+# My results
+# ---------------------------------------------------------------------------
+
+def page_results():
+    theme.hero("My results", "Every pick you have saved, and how they turned out.")
     log = _cached_bet_log(_uid())
     balance = current_bankroll(user_id=_uid())
 
-    settled = log[log["status"].isin(("won", "lost"))] if not log.empty else pd.DataFrame()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Balance", f"{balance:,.2f}")
-    c2.metric("Bets logged", f"{len(log):,}")
-    if not settled.empty:
-        roi = settled["pnl"].sum() / settled["stake"].sum()
-        c3.metric("All-time ROI", f"{roi:+.2%}")
-        c4.metric("Longest losing streak", _longest_losing_streak(settled))
-
     if log.empty:
-        st.info("No bets logged yet. Generate a slip on **This Week** and log it.")
+        theme.card("Your balance", _money(balance), container=st)
+        st.info("Nothing saved yet. Go to **This week**, then press *Save these to my "
+                "history*. Results fill in on their own once the matches are played.")
+        glossary()
         return
 
-    st.subheader("Rolling 300-bet ROI")
-    st.caption(
-        "The primary performance metric, shown with its confidence interval. Over 300 "
-        "bets the standard error on ROI is roughly 7 percentage points, so the band "
-        "matters more than the line: **a 300-bet window cannot distinguish a 4% edge "
-        "from zero.**"
-    )
-    roll = rolling_roi(log, window=300)
-    if roll.empty:
-        st.caption("Not enough settled bets to show a rolling window yet "
-                   "(at least 30 settled bets are needed).")
-    else:
-        # Index on the date, not the timestamp: with kickoffs clustered at similar
-        # times the axis otherwise renders as a row of identical "12 PM" labels.
-        chart = roll.copy()
-        chart["date"] = pd.to_datetime(chart["kickoff_utc"]).dt.normalize()
-        st.line_chart(chart.set_index("date")[["roi", "ci_low", "ci_high"]])
-        latest = roll.iloc[-1]
-        st.caption(
-            f"Latest window: **{latest['roi']:+.2%}** over {int(latest['n'])} bets, "
-            f"95% CI [{latest['ci_low']:+.2%}, {latest['ci_high']:+.2%}]."
-            + ("  The interval spans zero — this is not yet evidence of an edge."
-               if latest["ci_low"] < 0 < latest["ci_high"] else "")
-        )
+    done = log[log["status"].isin(("won", "lost"))]
+    c1, c2, c3, c4 = st.columns(4)
+    theme.card("Your balance", _money(balance), container=c1)
+    theme.card("Picks saved", f"{len(log):,}",
+               f"{int((log['status'] == 'pending').sum())} still to play", container=c2)
+    if not done.empty:
+        profit = done["pnl"].sum()
+        theme.card("Profit so far", _money(profit),
+                   f"from {_money(done['stake'].sum())} staked",
+                   tone="bad" if profit < 0 else "accent", container=c3)
+        theme.card("Won", f"{int((done['status'] == 'won').sum())} of {len(done)}",
+                   container=c4)
 
-    st.subheader("Paper vs real")
-    split = log.groupby("mode").apply(
-        lambda g: pd.Series({
-            "bets": len(g),
-            "staked": g["stake"].sum(),
-            "pnl": g["pnl"].fillna(0).sum(),
-            "clv": g["clv"].dropna().mean() if g["clv"].notna().any() else np.nan,
-        }),
-        include_groups=False,
-    ).reset_index()
-    st.dataframe(split, hide_index=True, use_container_width=True)
-
-    st.subheader("Monthly P&L")
-    st.warning(
-        "**This is variance, not signal.** At around 30 bets a month, even a genuine "
-        "4% edge produces a losing month roughly 4 times in 10. Judge the model on the "
-        "rolling window and on CLV, never on a month."
-    )
-    if not settled.empty:
-        m = settled.copy()
-        m["month"] = m["kickoff_utc"].dt.to_period("M").astype(str)
-        monthly = m.groupby("month").agg(bets=("pnl", "size"), staked=("stake", "sum"),
-                                         pnl=("pnl", "sum")).reset_index()
-        st.bar_chart(monthly.set_index("month")["pnl"])
-        st.dataframe(monthly, hide_index=True, use_container_width=True)
-
-    st.subheader("Bet log")
     c1, c2 = st.columns([1, 3])
-    if c1.button("Auto-settle now"):
+    if c1.button("Check for results", use_container_width=True):
         stats = settle_pending()
         st.cache_data.clear()
-        c2.success(stats.summary())
+        c2.success(f"Updated {stats.settled} pick(s). {stats.still_pending} still to play.")
 
+    st.subheader("Your picks")
     view = log.copy()
-    view["match"] = view["home"] + " v " + view["away"]
-    view["score"] = view.apply(
-        lambda r: f"{int(r.fthg)}-{int(r.ftag)}" if pd.notna(r.fthg) else "", axis=1
-    )
+    view["Match"] = view["home"] + " v " + view["away"]
+    view["Bet on"] = view["selection"].map(plain.PICK_WORDS)
+    view["Market"] = view["market"].map(plain.MARKET_WORDS).fillna(view["market"])
+    view["Score"] = [f"{int(h)}-{int(a)}" if pd.notna(h) else "not played yet"
+                     for h, a in zip(view["fthg"], view["ftag"], strict=True)]
+    view["Result"] = view["status"].map(
+        {"won": "Won", "lost": "Lost", "void": "Void", "pending": "Waiting"})
+    view["Kick-off"] = view["kickoff_utc"].dt.strftime("%a %d %b")
     st.dataframe(
-        view[["id", "kickoff_utc", "league_code", "match", "selection", "odds_taken",
-              "stake", "mode", "status", "score", "pnl", "closing_odds", "clv"]],
+        view[["Kick-off", "Match", "Market", "Bet on", "odds_taken", "stake", "Score",
+              "Result", "pnl"]].rename(columns={"odds_taken": "Odds", "stake": "Stake",
+                                      "pnl": "Profit"}),
         hide_index=True, use_container_width=True,
+        column_config={
+            "Odds": st.column_config.NumberColumn(format="%.2f"),
+            "Stake": st.column_config.NumberColumn(format="€%.2f"),
+            "Profit": st.column_config.NumberColumn(format="€%.2f"),
+        },
     )
 
-    with st.expander("Manual settlement"):
-        st.caption("For the cases auto-settlement cannot see: voided matches, "
-                   "cashed-out bets, bookmaker corrections.")
-        bet_id = st.number_input("Bet id", min_value=1, step=1)
-        status = st.selectbox("Status", ["won", "lost", "void", "pending"])
-        override = st.number_input("P&L override (0 to compute automatically)", value=0.0)
-        if st.button("Apply manual settlement"):
+    if len(done) >= 30:
+        st.subheader("Are you actually winning?")
+        st.warning(
+            "**Not enough bets can tell you.** Over 300 bets, luck alone moves your "
+            "return by around 7 percentage points either way — so a run of good or bad "
+            "results proves very little. The shaded range below is the honest answer; "
+            "the line in the middle is not."
+        )
+        roll = rolling_roi(log, window=300)
+        if not roll.empty:
+            chart = roll.copy()
+            chart["date"] = pd.to_datetime(chart["kickoff_utc"]).dt.normalize()
+            chart = chart.rename(columns={"roi": "Return", "ci_low": "Could be as low as",
+                                          "ci_high": "Could be as high as"})
+            for col in ("Return", "Could be as low as", "Could be as high as"):
+                chart[col] = chart[col] * 100
+            st.line_chart(chart.set_index("date")[
+                ["Return", "Could be as low as", "Could be as high as"]])
+            last = roll.iloc[-1]
+            st.caption(
+                f"Latest: **{_pct(last['roi'])}** over {int(last['n'])} picks, but "
+                f"anywhere from {_pct(last['ci_low'])} to {_pct(last['ci_high'])} would "
+                "look the same."
+                + ("  That range includes zero, so this is not yet evidence of anything."
+                   if last["ci_low"] < 0 < last["ci_high"] else "")
+            )
+
+    with st.expander("Month by month"):
+        st.caption("**This is luck, not skill.** At around 30 picks a month, even a "
+                   "genuinely good model has a losing month about four times in ten. "
+                   "Do not change anything because of one bad month.")
+        if not done.empty:
+            m = done.copy()
+            m["Month"] = m["kickoff_utc"].dt.to_period("M").astype(str)
+            monthly = m.groupby("Month").agg(Picks=("pnl", "size"),
+                                             Staked=("stake", "sum"),
+                                             Profit=("pnl", "sum")).reset_index()
+            st.bar_chart(monthly.set_index("Month")["Profit"])
+            st.dataframe(monthly, hide_index=True, use_container_width=True)
+
+    with st.expander("Money in and out"):
+        st.caption("Add money you have deposited, or take out what you have withdrawn.")
+        c1, c2 = st.columns(2)
+        amount = c1.number_input("Amount (negative to take out)", value=0.0, step=10.0)
+        if c2.button("Record it") and amount:
+            record_bankroll_event("deposit" if amount > 0 else "withdrawal", amount,
+                                  note="manual", user_id=_uid())
+            st.cache_data.clear()
+            st.rerun()
+        st.dataframe(bankroll_history(user_id=_uid()), hide_index=True,
+                     use_container_width=True)
+
+    with st.expander("Fix a result by hand"):
+        st.caption("For the cases the app cannot see: a match voided, a bet cashed out "
+                   "early, or the bookmaker correcting something.")
+        bet_id = st.number_input("Pick number (from the table above)", min_value=1, step=1)
+        status = st.selectbox("What happened", ["won", "lost", "void", "pending"],
+                              format_func=lambda s: {"won": "It won", "lost": "It lost",
+                                                     "void": "Voided — stake returned",
+                                                     "pending": "Not settled yet"}[s])
+        override = st.number_input("Profit, if it was not the usual amount", value=0.0)
+        if st.button("Save this correction"):
             try:
                 manual_settle(int(bet_id), status, override or None, user_id=_uid())
                 st.cache_data.clear()
-                st.success(f"Bet {int(bet_id)} set to {status}.")
+                st.success("Saved.")
             except (KeyError, ValueError) as exc:
                 st.error(str(exc))
-
-    with st.expander("Bankroll ledger"):
-        st.caption("Append-only. The balance is derived from these events, never "
-                   "edited in place.")
-        st.dataframe(bankroll_history(user_id=_uid()), hide_index=True, use_container_width=True)
-        c1, c2 = st.columns(2)
-        amount = c1.number_input("Deposit / withdrawal", value=0.0, step=10.0)
-        if c2.button("Record") and amount:
-            record_bankroll_event(
-                "deposit" if amount > 0 else "withdrawal", amount, note="manual",
-                user_id=_uid(),
-            )
-            st.cache_data.clear()
-            st.success("Recorded.")
-
-
-def _longest_losing_streak(settled: pd.DataFrame) -> int:
-    longest = current = 0
-    for r in settled.sort_values("kickoff_utc")["status"]:
-        if r == "lost":
-            current += 1
-            longest = max(longest, current)
-        elif r == "won":
-            current = 0
-    return longest
+    glossary()
 
 
 # ---------------------------------------------------------------------------
-# Page 4: Settings
+# Settings
 # ---------------------------------------------------------------------------
 
 def page_settings():
-    theme.hero("Settings", "Thresholds, staking and risk controls. These are yours "
-                           "alone; other accounts keep their own.")
     cfg = load_config()
     s = effective_settings(user_id=_uid())
+    theme.hero("Settings", "Yours alone — other people using this app keep their own.")
 
-    st.subheader("Real-money mode")
-    readiness = _readiness_banner()
-    c1, c2, c3 = st.columns(3)
-    c1.metric(
-        "Backtest vs closing odds",
-        "beats" if readiness.backtest_beats_closing else "does not beat",
-        delta=(f"{readiness.backtest_gap * 1000:+.2f} millinats"
-               if readiness.backtest_gap is not None else None),
-        delta_color="inverse",
-    )
-    # delta_color="off" because a bet count is neither good nor bad news; the
-    # default green would read as approval of "0 bets".
-    c2.metric("Paper trading", f"{readiness.paper_weeks:.1f} weeks",
-              delta=f"{readiness.paper_bets} bets", delta_color="off")
-    c3.metric("Paper CLV",
-              _pct(readiness.paper_clv_mean) if readiness.paper_clv_mean is not None else "n/a",
-              delta="significant" if readiness.paper_clv_significant else "not significant",
-              delta_color="normal" if readiness.paper_clv_significant else "inverse")
+    st.subheader("Real money")
+    r = real_money_readiness(user_id=_uid())
+    if r.ready:
+        st.success("**The evidence supports betting real money.**")
+    else:
+        st.error("**The evidence does not support betting real money yet.**")
+    for line in plain.readiness_lines(r):
+        st.markdown(line)
 
-    paper = st.toggle("Paper trading mode", value=bool(s["paper_mode"]))
-    if not paper and not readiness.ready:
+    practice = st.toggle("Practice mode — no real money", value=bool(s["paper_mode"]))
+    if not practice and not r.ready:
         st.error(
-            "Turning this off bets real money on a model that has not met the "
-            "project's own criteria. The evidence above is the reason those criteria "
-            "exist. You can still do it — but do it knowing that."
+            "Switching this off means staking real money on a model that has not "
+            "passed its own tests. You can do it. Do it knowing that."
         )
-    if st.button("Save mode"):
-        set_setting("paper_mode", bool(paper), user_id=_uid())
+    if st.button("Save"):
+        set_setting("paper_mode", bool(practice), user_id=_uid())
         st.success("Saved.")
 
     st.divider()
-    st.subheader("Staking and thresholds")
-    c1, c2 = st.columns(2)
-    with c1:
-        bankroll = st.number_input("Starting bankroll", value=float(s["starting_bankroll"]),
-                                   min_value=1.0, step=50.0)
-        kelly = st.slider("Kelly fraction", 0.05, 1.0, float(s["kelly_fraction"]), 0.05,
-                          help="Full Kelly assumes your probabilities are correct. They "
-                               "are estimates, and overstaking compounds badly: twice the "
-                               "optimal fraction has zero expected growth.")
-        max_stake = st.slider("Max stake (% of bankroll)", 0.005, 0.10,
-                              float(s["max_stake_pct"]), 0.005, format="%.3f")
-    with c2:
-        min_edge = st.slider("Minimum edge", 0.0, 0.20, float(s["min_edge"]), 0.005,
-                             format="%.3f")
-        odds_range = st.slider("Odds range", 1.0, 10.0,
-                               (float(s["min_odds"]), float(s["max_odds"])), 0.05)
-        max_bets = st.number_input("Max bets per week", value=int(s["max_bets_per_week"]),
-                                   min_value=1, max_value=50)
+    st.subheader("How much to stake")
+    current_style = plain.style_of(s)
+    options = list(plain.STAKING_STYLES)
+    style = st.radio(
+        "Style",
+        options,
+        index=options.index(current_style) if current_style in options else 1,
+        format_func=lambda name: f"{name} — {plain.STAKING_STYLES[name]['blurb']}",
+        label_visibility="collapsed",
+    )
+    if current_style == "Custom":
+        st.caption("Your current numbers do not match any of these three. Picking one "
+                   "will replace them.")
 
-    st.subheader("Risk controls")
-    c1, c2 = st.columns(2)
-    stop_loss = c1.slider("Weekly stop-loss (% of bankroll)", 0.0, 0.50,
-                          float(s["weekly_stop_loss_pct"]), 0.01)
-    max_dd = c2.slider("Drawdown pause (% from peak)", 0.05, 0.75,
-                       float(s["max_drawdown_pct"]), 0.01)
+    balance = st.number_input("Starting balance (€)", value=float(s["starting_bankroll"]),
+                              min_value=1.0, step=50.0)
 
     st.subheader("Leagues")
-    all_codes = [lg.code for lg in cfg.leagues]
-    labels = {lg.code: f"{lg.code} — {lg.name}" for lg in cfg.leagues}
-    enabled = st.multiselect("Enabled", all_codes, default=list(s["enabled_leagues"]),
+    labels = {lg.code: lg.name for lg in cfg.leagues}
+    leagues = st.multiselect("Which leagues to look at", list(labels),
+                             default=list(s["enabled_leagues"]),
                              format_func=lambda c: labels.get(c, c))
 
     if st.button("Save settings", type="primary"):
-        for key, value in {
-            "starting_bankroll": bankroll, "kelly_fraction": kelly,
-            "max_stake_pct": max_stake, "min_edge": min_edge,
-            "min_odds": odds_range[0], "max_odds": odds_range[1],
-            "max_bets_per_week": int(max_bets), "weekly_stop_loss_pct": stop_loss,
-            "max_drawdown_pct": max_dd, "enabled_leagues": enabled,
-        }.items():
+        preset = {k: v for k, v in plain.STAKING_STYLES[style].items() if k != "blurb"}
+        for key, value in {**preset, "starting_bankroll": balance,
+                           "enabled_leagues": leagues}.items():
             set_setting(key, value, user_id=_uid())
         st.cache_data.clear()
-        st.success("Saved. These override config.yaml.")
+        st.success("Saved.")
+
+    with st.expander("Advanced — the individual numbers"):
+        st.caption("The three styles above are shortcuts for these. Change them here if "
+                   "you know what you want; it will show as *Custom*.")
+        c1, c2 = st.columns(2)
+        kelly = c1.slider(
+            "Share of the mathematically optimal stake", 0.05, 1.0,
+            float(s["kelly_fraction"]), 0.05,
+            help="Staking the full optimal amount assumes the model's probabilities "
+                 "are exactly right. They are estimates, and overstaking compounds "
+                 "badly — twice the optimal amount grows your money not at all.")
+        max_stake = c1.slider("Most to risk on one match (share of balance)",
+                              0.005, 0.10, float(s["max_stake_pct"]), 0.005,
+                              format="%.3f")
+        min_value = c2.slider("Minimum value before a match qualifies", 0.0, 0.20,
+                              float(s["min_edge"]), 0.005, format="%.3f")
+        odds = c2.slider("Only suggest odds between", 1.0, 10.0,
+                         (float(s["min_odds"]), float(s["max_odds"])), 0.05)
+        max_bets = c1.number_input("Most picks in a week", value=int(s["max_bets_per_week"]),
+                                   min_value=1, max_value=50)
+        stop_loss = c2.slider("Stop for the week after losing this share of the balance",
+                              0.0, 0.50, float(s["weekly_stop_loss_pct"]), 0.01)
+        max_dd = c2.slider("Pause everything after falling this far from your peak",
+                           0.05, 0.75, float(s["max_drawdown_pct"]), 0.01)
+        if st.button("Save these numbers"):
+            for key, value in {
+                "kelly_fraction": kelly, "max_stake_pct": max_stake,
+                "min_edge": min_value, "min_odds": odds[0], "max_odds": odds[1],
+                "max_bets_per_week": int(max_bets),
+                "weekly_stop_loss_pct": stop_loss, "max_drawdown_pct": max_dd,
+            }.items():
+                set_setting(key, value, user_id=_uid())
+            st.cache_data.clear()
+            st.success("Saved.")
+    glossary()
 
 
 # ---------------------------------------------------------------------------
-# Page 5: Ask
+# Ask
 # ---------------------------------------------------------------------------
 
 def page_ask():
     theme.hero(
         "Ask",
-        "An assistant with read-only access to the database. It can look things up "
-        "and change your thresholds. It cannot place, log or settle bets, it cannot "
-        "turn off paper trading, and it only ever sees your own bets.",
+        "Ask anything about your picks, your results, or the data behind them. It can "
+        "also change your settings for you. It cannot place bets, and it cannot turn "
+        "off practice mode.",
     )
 
     usable, reason = chat.is_available()
@@ -590,29 +658,32 @@ def page_ask():
         return
 
     if "ask_messages" not in st.session_state:
-        st.session_state.ask_messages = []   # raw API conversation
-        st.session_state.ask_display = []    # what gets drawn, turn by turn
-
-    if st.button("Clear conversation"):
         st.session_state.ask_messages = []
         st.session_state.ask_display = []
-        st.rerun()
+
+    if st.session_state.ask_display:
+        if st.button("Start over"):
+            st.session_state.ask_messages = []
+            st.session_state.ask_display = []
+            st.rerun()
+    else:
+        st.caption("Try: *how did I do last month?* · *which league gives me the most "
+                   "picks?* · *make me more careful*")
 
     for entry in st.session_state.ask_display:
         with st.chat_message(entry["role"]):
             if entry.get("tools"):
-                with st.expander(f"{len(entry['tools'])} tool call(s)"):
+                with st.expander(f"Looked up {len(entry['tools'])} thing(s)"):
                     for call in entry["tools"]:
                         st.markdown(f"**{call.name}** {'⚠️' if call.error else ''}")
                         if call.input:
-                            st.code(
-                                call.input.get("sql") or json.dumps(call.input, default=str),
-                                language="sql" if "sql" in call.input else "json",
-                            )
+                            st.code(call.input.get("sql")
+                                    or json.dumps(call.input, default=str),
+                                    language="sql" if "sql" in call.input else "json")
                         st.caption(str(call.result)[:2000])
             st.markdown(entry["text"])
 
-    prompt = st.chat_input("Ask about your data, or tell me a setting to change")
+    prompt = st.chat_input("Ask a question, or tell it what to change")
     if not prompt:
         return
 
@@ -621,130 +692,165 @@ def page_ask():
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
-            try:
-                turn = chat.respond(st.session_state.ask_messages)
-            except Exception as exc:
-                # A failed call leaves a dangling user message; drop it so the next
-                # question starts from a valid conversation rather than a 400.
-                st.session_state.ask_messages.pop()
-                st.session_state.ask_display.pop()
-                st.error(f"The assistant call failed: {exc}")
-                return
-        st.session_state.ask_display.append(
-            {"role": "assistant", "text": turn.text, "tools": turn.tool_calls}
-        )
-        if any(c.name == "update_setting" and not c.error for c in turn.tool_calls):
-            st.cache_data.clear()
-        st.rerun()
+    with st.chat_message("assistant"), st.spinner("Thinking…"):
+        try:
+            turn = chat.respond(st.session_state.ask_messages, user_id=_uid())
+        except Exception as exc:
+            # A failed call leaves a dangling question; drop it so the next one
+            # starts from a valid conversation rather than an error.
+            st.session_state.ask_messages.pop()
+            st.session_state.ask_display.pop()
+            st.error(f"That didn't work: {exc}")
+            return
+    st.session_state.ask_display.append(
+        {"role": "assistant", "text": turn.text, "tools": turn.tool_calls})
+    if any(c.name == "update_setting" and not c.error for c in turn.tool_calls):
+        st.cache_data.clear()
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
-# Page 6: Account (everyone) and People (owner only)
+# Account and People
 # ---------------------------------------------------------------------------
 
 def page_account():
     account = _account()
-    theme.hero("Account", "Your sign-in details and password.")
+    theme.hero("Account", "Your sign-in details.")
 
     c1, c2 = st.columns(2)
     theme.card("Signed in as", account.display_name, account.email, container=c1)
-    theme.card("Role", account.role.title(),
-               "Owners can add and disable accounts." if account.is_owner
-               else "Members see only their own bets and bankroll.", container=c2)
+    theme.card("Role", "Owner" if account.is_owner else "Member",
+               "You can add and remove people." if account.is_owner
+               else "You see only your own picks and balance.", container=c2)
 
-    st.subheader("Change password")
+    st.subheader("Change your password")
     with st.form("change_password", clear_on_submit=True):
         current = st.text_input("Current password", type="password")
         new = st.text_input("New password", type="password")
-        again = st.text_input("Confirm new password", type="password")
-        if st.form_submit_button("Update password", type="primary"):
+        again = st.text_input("New password again", type="password")
+        if st.form_submit_button("Update", type="primary"):
             if new != again:
-                st.error("The two new passwords do not match.")
+                st.error("The two new passwords are not the same.")
             else:
                 try:
                     auth.change_password(account.id, current, new)
-                    st.success("Password updated.")
+                    st.success("Done.")
                 except auth.AuthError as exc:
                     st.error(str(exc))
 
-    st.caption(
-        "Signing in is per browser session — refreshing the page signs you out "
-        "again. Nothing about your login is stored on this device."
-    )
+    st.caption("Refreshing the page signs you out. Nothing about your login is kept "
+               "on this device.")
 
 
 def page_people():
-    theme.hero("People", "Accounts on this instance. Each one has its own bankroll, "
-                         "bet history and settings — nobody sees anybody else's.")
+    theme.hero("People", "Everyone who can sign in. Each person has their own balance, "
+                         "picks and settings — nobody sees anybody else's.")
     if not _account().is_owner:
-        st.error("Only the owner can manage accounts.")
+        st.error("Only the owner can manage people.")
         return
 
     users = auth.list_users()
+    show = pd.DataFrame(users)
+    show["Role"] = show["role"].str.title()
+    show["Can sign in"] = show["is_active"]
     st.dataframe(
-        pd.DataFrame(users)[["id", "display_name", "email", "role", "is_active",
-                             "last_login_at"]].rename(columns={
-            "display_name": "name", "is_active": "active", "last_login_at": "last seen"}),
+        show[["display_name", "email", "Role", "Can sign in", "last_login_at"]]
+        .rename(columns={"display_name": "Name", "email": "Email",
+                         "last_login_at": "Last seen"}),
         hide_index=True, use_container_width=True,
     )
 
-    st.subheader("Add someone")
-    st.caption("There is no public signup: you create the account and send them the "
-               "password yourself.")
+    st.subheader("Invite someone")
+    st.caption("You create the account and send them the password yourself — there is "
+               "no public sign-up.")
     with st.form("add_user", clear_on_submit=True):
         c1, c2 = st.columns(2)
-        email = c1.text_input("Email")
-        name = c2.text_input("Display name")
+        email = c1.text_input("Their email")
+        name = c2.text_input("Their name")
         c1, c2 = st.columns(2)
-        password = c1.text_input("Temporary password", type="password")
-        role = c2.selectbox("Role", ["member", "owner"])
-        if st.form_submit_button("Create account", type="primary"):
+        password = c1.text_input("A password to give them", type="password")
+        role = c2.selectbox("Role", ["member", "owner"],
+                            format_func=lambda r: "Member" if r == "member" else "Owner")
+        if st.form_submit_button("Create", type="primary"):
             try:
                 created = auth.create_user(email, password, name or None, role)
                 st.success(f"Created {created.email}. Send them that password and ask "
-                           "them to change it on the Account page.")
+                           "them to change it on their Account page.")
             except auth.AuthError as exc:
                 st.error(str(exc))
 
-    st.subheader("Disable or re-enable")
+    st.subheader("Remove access")
     others = [u for u in users if u["id"] != _account().id]
     if not others:
-        st.caption("No other accounts yet.")
-    else:
-        labels = {u["id"]: f"{u['display_name']} <{u['email']}>" for u in others}
-        target = st.selectbox("Account", list(labels), format_func=labels.get)
-        active = next(u["is_active"] for u in others if u["id"] == target)
-        if st.button("Re-enable" if not active else "Disable"):
-            try:
-                auth.set_active(target, not active)
-                st.rerun()
-            except auth.AuthError as exc:
-                st.error(str(exc))
+        st.caption("Nobody else yet.")
+        return
+    labels = {u["id"]: f"{u['display_name']} ({u['email']})" for u in others}
+    target = st.selectbox("Who", list(labels), format_func=labels.get)
+    active = next(u["is_active"] for u in others if u["id"] == target)
+    if st.button("Let them back in" if not active else "Stop them signing in"):
+        try:
+            auth.set_active(target, not active)
+            st.rerun()
+        except auth.AuthError as exc:
+            st.error(str(exc))
 
 
 # ---------------------------------------------------------------------------
-# Sign-in
+# Getting in
 # ---------------------------------------------------------------------------
+
+def _needs_first_account() -> bool:
+    """No real account yet — only the placeholder the command line owns, if any.
+
+    That placeholder has an unusable password, so offering a sign-in form for it
+    would be a dead end. Offer to make a real account instead.
+    """
+    users = auth.list_users()
+    return not users or all(u["email"] == auth.LOCAL_EMAIL for u in users)
+
+
+def first_run_screen():
+    """Set-up, in the browser. Nobody should need a terminal to get an account.
+
+    Only reachable while no real account exists, so it cannot become a public
+    sign-up route: the moment the first owner is created, this screen is gone for
+    good and further accounts come from that owner.
+    """
+    _, middle, _ = st.columns([1, 1.15, 1])
+    with middle:
+        st.markdown("<div style='height:6vh'></div>", unsafe_allow_html=True)
+        theme.wordmark()
+        st.subheader("Set up your account")
+        st.caption("This is the first account, so it will be the owner. Nobody else "
+                   "can sign up on their own — you invite them.")
+        with st.form("first_account"):
+            name = st.text_input("Your name")
+            email = st.text_input("Email")
+            password = st.text_input("Choose a password", type="password",
+                                     help="At least 10 characters. Make it up — there "
+                                          "is nothing to look up.")
+            again = st.text_input("Type it again", type="password")
+            if st.form_submit_button("Create my account", type="primary",
+                                     use_container_width=True):
+                if password != again:
+                    st.error("The two passwords are not the same.")
+                else:
+                    try:
+                        st.session_state.account = auth.create_user(
+                            email, password, name or None, "owner")
+                        st.rerun()
+                    except auth.AuthError as exc:
+                        st.error(str(exc))
+    theme.legal_footer()
+
 
 def sign_in_screen():
-    """The whole app sits behind this. No navigation is built until it passes."""
     # Columns, not a wrapping <div>: Streamlit renders each element in its own
     # container, so an opened div never actually wraps what follows it.
     _, middle, _ = st.columns([1, 1.15, 1])
     with middle:
         st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
         theme.wordmark()
-
-        if auth.user_count() == 0 or _only_local_account():
-            st.info(
-                "**No accounts yet.** Create the first one from a terminal:\n\n"
-                "```\nuv run fv user add you@example.com --owner\n```\n"
-                "Then sign in here."
-            )
-            return
-
         with st.form("sign_in"):
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
@@ -754,18 +860,8 @@ def sign_in_screen():
                     st.rerun()
                 except auth.AuthError as exc:
                     st.error(str(exc))
-        st.caption("No public signup — the owner creates accounts.")
+        st.caption("Forgotten it? Ask whoever set this up to give you a new one.")
     theme.legal_footer()
-
-
-def _only_local_account() -> bool:
-    """True when the only account is the placeholder the CLI created for itself.
-
-    That account has an unusable password hash, so showing a login form for it would
-    be a dead end — better to say plainly that a real account has to be made first.
-    """
-    users = auth.list_users()
-    return bool(users) and all(u["email"] == auth.LOCAL_EMAIL for u in users)
 
 
 # ---------------------------------------------------------------------------
@@ -775,22 +871,18 @@ def _only_local_account() -> bool:
 def sidebar():
     account = _account()
     settings = effective_settings(user_id=_uid())
-
     st.sidebar.markdown(
         f"<div style='color:{theme.MUTED};font-size:.8rem'>Signed in as</div>"
         f"<div style='font-weight:600;margin-bottom:.6rem'>{account.display_name}</div>",
         unsafe_allow_html=True,
     )
-    st.sidebar.metric("Bankroll", f"{current_bankroll(user_id=_uid()):,.2f}")
-    st.sidebar.caption(
-        "Paper mode — no real money" if settings["paper_mode"]
-        else "**REAL MONEY MODE**"
-    )
+    st.sidebar.metric("Balance", _money(current_bankroll(user_id=_uid())))
+    st.sidebar.caption("Practice mode — no real money" if settings["paper_mode"]
+                       else "**REAL MONEY**")
     st.sidebar.divider()
     if st.sidebar.button("Sign out", use_container_width=True):
-        st.session_state.pop("account", None)
-        st.session_state.pop("ask_messages", None)
-        st.session_state.pop("ask_display", None)
+        for key in ("account", "ask_messages", "ask_display"):
+            st.session_state.pop(key, None)
         st.cache_data.clear()
         st.rerun()
 
@@ -800,25 +892,25 @@ def main():
     ensure_schema()
 
     if "account" not in st.session_state:
-        sign_in_screen()
+        first_run_screen() if _needs_first_account() else sign_in_screen()
         return
 
-    # An account disabled while its session is open should lose access on the next
-    # click, not at the next sign-in.
+    # Someone whose access is removed mid-session should lose it on the next click,
+    # not at the next sign-in.
     live = auth.get_account(st.session_state.account.id)
     if live is None:
         st.session_state.pop("account", None)
-        st.warning("That account is no longer active.")
+        st.warning("That account can no longer sign in.")
         sign_in_screen()
         return
     st.session_state.account = live
 
     sidebar()
-
     pages = [
-        st.Page(page_this_week, title="This Week", icon=":material/sports_soccer:", default=True),
-        st.Page(page_backtest, title="Backtest", icon=":material/timeline:"),
-        st.Page(page_bankroll, title="Bankroll", icon=":material/account_balance_wallet:"),
+        st.Page(page_this_week, title="This week", icon=":material/sports_soccer:",
+                default=True),
+        st.Page(page_results, title="My results", icon=":material/receipt_long:"),
+        st.Page(page_track_record, title="Track record", icon=":material/timeline:"),
         st.Page(page_ask, title="Ask", icon=":material/forum:"),
         st.Page(page_settings, title="Settings", icon=":material/tune:"),
         st.Page(page_account, title="Account", icon=":material/person:"),

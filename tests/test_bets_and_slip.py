@@ -358,3 +358,66 @@ def test_a_value_slip_carries_no_filled_warning():
     })
     text = slip_to_text(Slip(sel, pd.DataFrame(), bankroll=1000.0, mode="value"))
     assert "FILLED SLIP" not in text
+
+
+# ---------------------------------------------------------------------------
+# The goals market
+# ---------------------------------------------------------------------------
+
+def test_fixtures_parser_reads_the_over_under_prices():
+    """The prices were always in fixtures.csv; only the 1X2 columns were read, which
+    is the entire reason the slip could offer nothing but home/draw/away."""
+    from fv.data.fixtures import parse_fixtures
+
+    csv = (
+        "Div,Date,Time,HomeTeam,AwayTeam,B365H,B365D,B365A,B365>2.5,B365<2.5\n"
+        "N1,09/08/2026,13:30,Groningen,Utrecht,2.30,3.50,3.00,1.80,2.00\n"
+    ).encode()
+    frame = parse_fixtures(csv, {"N1"})
+    row = frame.iloc[0]
+    assert row["b365_o25"] == pytest.approx(1.80)
+    assert row["b365_u25"] == pytest.approx(2.00)
+
+
+def test_a_goals_bet_settles_from_the_score(cfg):
+    from fv.bets import bet_log, current_bankroll, log_slip, settle_pending
+
+    mid = _add_match(cfg, played=True, score=(2, 1))  # three goals: over 2.5 wins
+    before = current_bankroll(cfg)
+    selections = pd.DataFrame([{"match_id": mid, "market": "OU25", "selection": "O",
+                                "odds": 1.90, "stake": 10.0}])
+    log_slip(selections, cfg=cfg)
+    settle_pending(cfg)
+
+    row = bet_log(cfg).iloc[0]
+    assert row["market"] == "OU25"
+    assert row["status"] == "won"
+    assert current_bankroll(cfg) == pytest.approx(before + 9.0)
+
+
+def test_the_same_match_can_carry_a_winner_bet_and_a_goals_bet(cfg):
+    """They are different questions, so logging both is not a duplicate."""
+    from fv.bets import bet_log, log_slip
+
+    mid = _add_match(cfg)
+    log_slip(pd.DataFrame([{"match_id": mid, "market": "1X2", "selection": "H",
+                            "odds": 2.10, "stake": 5.0}]), cfg=cfg)
+    log_slip(pd.DataFrame([{"match_id": mid, "market": "OU25", "selection": "O",
+                            "odds": 1.90, "stake": 5.0}]), cfg=cfg)
+    assert len(bet_log(cfg)) == 2
+
+
+def test_a_bet_without_a_market_is_still_treated_as_1x2(cfg):
+    """Slips built before the goals markets existed carry no market column."""
+    from fv.bets import bet_log, log_slip
+
+    mid = _add_match(cfg)
+    log_slip(_selections(mid), cfg=cfg)
+    assert bet_log(cfg).iloc[0]["market"] == "1X2"
+
+
+def test_rank_by_is_validated():
+    from fv.slip import generate_slip
+
+    with pytest.raises(ValueError, match="rank_by"):
+        generate_slip(rank_by="whatever")

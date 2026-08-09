@@ -294,6 +294,9 @@ class Bet(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     slip_id: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
     match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    # Which market the bet was struck on: 1X2 or OU25. Settlement dispatches on it,
+    # so a bet that does not carry its market cannot be settled correctly.
+    market: Mapped[str] = mapped_column(String(16), default="1X2")
     selection: Mapped[str] = mapped_column(String(8))
     odds_taken: Mapped[float] = mapped_column(Float)
     stake: Mapped[float] = mapped_column(Float)

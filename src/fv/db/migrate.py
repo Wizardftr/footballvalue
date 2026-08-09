@@ -37,6 +37,15 @@ def _add_user_column(conn, table: str, owner_id: int) -> str | None:
     return f"{table}: added user_id, assigned {result.rowcount} existing row(s) to the owner"
 
 
+def _add_market_column(conn) -> str | None:
+    """Bets written before the goals markets existed were all 1X2."""
+    if "market" in _columns(conn, "bets"):
+        return None
+    conn.execute(text("ALTER TABLE bets ADD COLUMN market VARCHAR(16)"))
+    result = conn.execute(text("UPDATE bets SET market = '1X2' WHERE market IS NULL"))
+    return f"bets: added market, marked {result.rowcount} existing bet(s) as 1X2"
+
+
 def ensure_schema(cfg: Config | None = None) -> list[str]:
     """Create anything missing and migrate anything old. Safe to run every startup."""
     cfg = cfg or load_config()
@@ -53,6 +62,14 @@ def ensure_schema(cfg: Config | None = None) -> list[str]:
             table in existing and "user_id" not in _columns(conn, table)
             for table in ("bets", "bankroll_events")
         )
+        needs_market = "bets" in existing and "market" not in _columns(conn, "bets")
+
+    if needs_market:
+        with engine.begin() as conn:
+            note = _add_market_column(conn)
+            if note:
+                notes.append(note)
+
     if not needs_owner:
         return notes
 

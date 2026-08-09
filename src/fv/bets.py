@@ -20,7 +20,7 @@ from fv.config import Config, load_config
 from fv.db.models import BankrollEvent, Bet, Match
 from fv.db.session import get_engine, session_scope
 from fv.odds.settlement import clv as clv_of
-from fv.odds.settlement import settle_1x2
+from fv.odds.settlement import settle_bet
 
 
 def new_slip_id() -> str:
@@ -97,10 +97,12 @@ def log_slip(
     n = 0
     with session_scope(cfg) as s:
         for r in selections.itertuples(index=False):
+            market = getattr(r, "market", "1X2")
             already = s.scalar(
                 select(Bet).where(
                     Bet.user_id == uid,
                     Bet.match_id == int(r.match_id),
+                    Bet.market == market,
                     Bet.selection == r.selection,
                     Bet.status == "pending",
                 )
@@ -112,6 +114,7 @@ def log_slip(
                     user_id=uid,
                     slip_id=slip_id,
                     match_id=int(r.match_id),
+                    market=market,
                     selection=r.selection,
                     odds_taken=float(r.odds),
                     stake=float(r.stake),
@@ -157,8 +160,9 @@ def settle_pending(cfg: Config | None = None) -> SettlementStats:
                 stats.still_pending += 1
                 continue
 
-            result = settle_1x2(
-                bet.selection, bet.stake, bet.odds_taken, match.fthg, match.ftag
+            result = settle_bet(
+                bet.market or "1X2", bet.selection, bet.stake, bet.odds_taken,
+                match.fthg, match.ftag,
             )
             bet.status = result.status
             bet.pnl = result.pnl
@@ -168,9 +172,9 @@ def settle_pending(cfg: Config | None = None) -> SettlementStats:
             closing = s.scalar(
                 text(
                     "SELECT decimal_odds FROM odds WHERE match_id=:m AND bookmaker='B365' "
-                    "AND market='1X2' AND selection=:s AND odds_type='closing' LIMIT 1"
+                    "AND market=:k AND selection=:s AND odds_type='closing' LIMIT 1"
                 ),
-                {"m": bet.match_id, "s": bet.selection},
+                {"m": bet.match_id, "k": bet.market or "1X2", "s": bet.selection},
             )
             if closing:
                 bet.closing_odds = float(closing)
@@ -255,7 +259,7 @@ def manual_settle(
 
 
 BET_LOG_QUERY = """
-SELECT b.id, b.slip_id, b.mode, b.status, b.selection, b.odds_taken, b.stake,
+SELECT b.id, b.slip_id, b.mode, b.status, b.market, b.selection, b.odds_taken, b.stake,
        b.pnl, b.closing_odds, b.clv, b.placed_at, b.settled_at, b.settled_by,
        m.league_code, m.season, m.kickoff_utc,
        th.canonical_name AS home, ta.canonical_name AS away,

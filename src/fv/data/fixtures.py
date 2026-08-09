@@ -82,6 +82,11 @@ def parse_fixtures(payload: bytes, league_codes: set[str]) -> pd.DataFrame:
             "b365_h": pd.to_numeric(df.get("B365H"), errors="coerce"),
             "b365_d": pd.to_numeric(df.get("B365D"), errors="coerce"),
             "b365_a": pd.to_numeric(df.get("B365A"), errors="coerce"),
+            # fixtures.csv carries the over/under 2.5 goals prices in the same row as
+            # the 1X2 ones. Reading only the 1X2 columns is why the slip could offer
+            # nothing but home/draw/away.
+            "b365_o25": pd.to_numeric(df.get("B365>2.5"), errors="coerce"),
+            "b365_u25": pd.to_numeric(df.get("B365<2.5"), errors="coerce"),
         }
     )
     return out[out["match_date"].notna()].reset_index(drop=True)
@@ -146,14 +151,21 @@ def download_fixtures(cfg: Config | None = None) -> FixtureStats:
                     stats.updated += 1
                 match = existing
 
-            for sel, value in (("H", row.b365_h), ("D", row.b365_d), ("A", row.b365_a)):
+            prices = (
+                ("1X2", "H", row.b365_h),
+                ("1X2", "D", row.b365_d),
+                ("1X2", "A", row.b365_a),
+                ("OU25", "O", row.b365_o25),
+                ("OU25", "U", row.b365_u25),
+            )
+            for market, sel, value in prices:
                 if value is None or pd.isna(value) or float(value) <= 1.0:
                     continue
                 found = s.scalar(
                     select(Odds).where(
                         Odds.match_id == match.id,
                         Odds.bookmaker == "B365",
-                        Odds.market == "1X2",
+                        Odds.market == market,
                         Odds.selection == sel,
                         Odds.odds_type == "pre",
                     )
@@ -163,7 +175,7 @@ def download_fixtures(cfg: Config | None = None) -> FixtureStats:
                         Odds(
                             match_id=match.id,
                             bookmaker="B365",
-                            market="1X2",
+                            market=market,
                             selection=sel,
                             decimal_odds=float(value),
                             odds_type="pre",
