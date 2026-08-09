@@ -6,8 +6,9 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 
-# Local data: raw CSV cache, SQLite db, generated reports
-data/
-reports/
-!data/.gitkeep
-!reports/.gitkeep
+# Local data: raw CSV cache, SQLite db, generated reports.
+# The leading slash anchors these to the repository root. Without it, git matches
+# the pattern at EVERY depth - which silently excluded the whole src/fv/data/
+# package from the repo, so a clean clone installed but could not download.
+/data/
+/reports/
