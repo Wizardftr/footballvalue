@@ -804,40 +804,54 @@ def page_settings():
             "Switching this off means staking real money on a model that has not "
             "passed its own tests. You can do it. Do it knowing that."
         )
-    if st.button("Save"):
+    if st.button("Save practice mode setting"):
         set_setting("paper_mode", bool(practice), user_id=_uid())
-        _saved()
+        _saved("Practice mode saved.")
 
     st.divider()
-    st.subheader("How much to stake")
-    current_style = plain.style_of(s)
-    options = list(plain.STAKING_STYLES)
-    style = st.radio(
-        "Style",
-        options,
-        index=options.index(current_style) if current_style in options else 1,
-        format_func=lambda name: f"{name} — {plain.STAKING_STYLES[name]['blurb']}",
-        label_visibility="collapsed",
-    )
-    if current_style == "Custom":
-        st.caption("Your current numbers do not match any of these three. Picking one "
-                   "will replace them.")
 
-    balance = st.number_input("Starting balance (€)", value=float(s["starting_bankroll"]),
-                              min_value=1.0, step=50.0)
+    # One form, one button. Two loose save buttons on this page meant the obvious
+    # one — directly under the toggle — saved only the toggle, so a changed balance
+    # further down was silently discarded. A form makes everything inside it commit
+    # together, and there is nothing to press but the right thing.
+    with st.form("main_settings"):
+        st.subheader("Your money")
+        c1, c2 = st.columns(2)
+        balance = c1.number_input(
+            "Starting balance (€)", value=float(s["starting_bankroll"]),
+            min_value=1.0, step=1.0,
+            help="What you are putting in. Once bets start settling, your balance "
+                 "follows the results instead of this number.",
+        )
+        theme.card("Balance right now", _money(current_bankroll(user_id=_uid())),
+                   "Changes here take effect when you press Save below.", container=c2)
 
-    st.subheader("Leagues")
-    labels = {lg.code: lg.name for lg in cfg.leagues}
-    leagues = st.multiselect("Which leagues to look at", list(labels),
-                             default=list(s["enabled_leagues"]),
-                             format_func=lambda c: labels.get(c, c))
+        st.subheader("How much to stake")
+        current_style = plain.style_of(s)
+        options = list(plain.STAKING_STYLES)
+        style = st.radio(
+            "Style", options,
+            index=options.index(current_style) if current_style in options else 1,
+            format_func=lambda name: f"{name} — {plain.STAKING_STYLES[name]['blurb']}",
+            label_visibility="collapsed",
+        )
+        if current_style == "Custom":
+            st.caption("Your current numbers do not match any of these three. Picking "
+                       "one will replace them.")
 
-    if st.button("Save settings", type="primary"):
-        preset = {k: v for k, v in plain.STAKING_STYLES[style].items() if k != "blurb"}
-        for key, value in {**preset, "starting_bankroll": balance,
-                           "enabled_leagues": leagues}.items():
-            set_setting(key, value, user_id=_uid())
-        _saved()
+        st.subheader("Leagues")
+        labels = {lg.code: lg.name for lg in cfg.leagues}
+        leagues = st.multiselect("Which leagues to look at", list(labels),
+                                 default=list(s["enabled_leagues"]),
+                                 format_func=lambda c: labels.get(c, c))
+
+        if st.form_submit_button("Save everything above", type="primary",
+                                 use_container_width=True):
+            preset = {k: v for k, v in plain.STAKING_STYLES[style].items() if k != "blurb"}
+            for key, value in {**preset, "starting_bankroll": balance,
+                               "enabled_leagues": leagues}.items():
+                set_setting(key, value, user_id=_uid())
+            _saved(f"Saved. Starting balance is now {_money(balance)}.")
 
     with st.expander("Advanced — the individual numbers"):
         st.caption("The three styles above are shortcuts for these. Change them here if "
