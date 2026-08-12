@@ -29,12 +29,15 @@ from fv.app import plain, theme
 from fv.bets import (
     bankroll_history,
     bet_log,
+    combo_legs,
+    combo_log,
     current_bankroll,
+    log_combo,
     log_slip,
     manual_settle,
     record_bankroll_event,
     rolling_roi,
-    settle_pending,
+    settle_all,
 )
 from fv.config import PROJECT_ROOT, load_config
 from fv.db.migrate import ensure_schema
@@ -71,6 +74,11 @@ def _pct(x, digits=1, signed=True):
     if x is None or (isinstance(x, float) and not np.isfinite(x)):
         return "n/a"
     return f"{x * 100:{'+' if signed else ''}.{digits}f}%"
+
+
+@st.cache_data(ttl=300)
+def _cached_combo_log(user_id: int):
+    return combo_log(user_id=user_id)
 
 
 @st.cache_data(ttl=300)
@@ -471,35 +479,92 @@ def page_track_record():
 def page_results():
     theme.hero("My results", "Every pick you have saved, and how they turned out.")
     log = _cached_bet_log(_uid())
+    combos = _cached_combo_log(_uid())
     balance = current_bankroll(user_id=_uid())
 
-    if log.empty:
+    if log.empty and combos.empty:
         theme.card("Your balance", _money(balance), container=st)
         st.info("Nothing saved yet. Go to **This week**, then press *Save these to my "
                 "history*. Results fill in on their own once the matches are played.")
         glossary()
         return
 
-    done = log[log["status"].isin(("won", "lost"))]
+    done = log[log["status"].isin(("won", "lost"))] if not log.empty else log
+    done_combos = (combos[combos["status"].isin(("won", "lost"))]
+                   if not combos.empty else combos)
+
+    # Both kinds of bet count once each. A combined bet is one bet, however many
+    # matches it rides on.
+    n_bets = len(log) + len(combos)
+    staked = (done["stake"].sum() if not done.empty else 0.0) + (
+        done_combos["stake"].sum() if not done_combos.empty else 0.0)
+    profit = (done["pnl"].sum() if not done.empty else 0.0) + (
+        done_combos["pnl"].sum() if not done_combos.empty else 0.0)
+    pending = (int((log["status"] == "pending").sum()) if not log.empty else 0) + (
+        int((combos["status"] == "pending").sum()) if not combos.empty else 0)
+    n_done = len(done) + len(done_combos)
+    n_won = (int((done["status"] == "won").sum()) if not done.empty else 0) + (
+        int((done_combos["status"] == "won").sum()) if not done_combos.empty else 0)
+
     c1, c2, c3, c4 = st.columns(4)
     theme.card("Your balance", _money(balance), container=c1)
-    theme.card("Picks saved", f"{len(log):,}",
-               f"{int((log['status'] == 'pending').sum())} still to play", container=c2)
-    if not done.empty:
-        profit = done["pnl"].sum()
-        theme.card("Profit so far", _money(profit),
-                   f"from {_money(done['stake'].sum())} staked",
+    theme.card("Bets saved", f"{n_bets:,}", f"{pending} still to play", container=c2)
+    if n_done:
+        theme.card("Profit so far", _money(profit), f"from {_money(staked)} staked",
                    tone="bad" if profit < 0 else "accent", container=c3)
-        theme.card("Won", f"{int((done['status'] == 'won').sum())} of {len(done)}",
-                   container=c4)
+        theme.card("Won", f"{n_won} of {n_done}", container=c4)
 
     c1, c2 = st.columns([1, 3])
     if c1.button("Check for results", use_container_width=True):
-        stats = settle_pending()
+        stats = settle_all()
         st.cache_data.clear()
-        c2.success(f"Updated {stats.settled} pick(s). {stats.still_pending} still to play.")
+        c2.success(f"Updated {stats.settled} bet(s). {stats.still_pending} still to play.")
 
-    st.subheader("Your picks")
+    if not combos.empty:
+        st.subheader("Combined bets")
+        st.caption("One stake riding on several matches. It pays only if every leg "
+                   "lands — a voided match drops out and shortens the price.")
+        view = combos.copy()
+        view["Placed"] = view["placed_at"].dt.strftime("%a %d %b")
+        view["Legs"] = (view["legs_won"].fillna(0).astype(int).astype(str) + " of "
+                        + view["legs"].astype(int).astype(str) + " landed")
+        view["Result"] = view["status"].map(
+            {"won": "Won", "lost": "Lost", "void": "Void", "pending": "Waiting"})
+        st.dataframe(
+            view[["id", "Placed", "combined_odds", "stake", "Legs", "Result", "pnl",
+                  "mode"]].rename(columns={"id": "#", "combined_odds": "Odds",
+                                           "stake": "Stake", "pnl": "Profit",
+                                           "mode": "Real or practice"}),
+            hide_index=True, use_container_width=True,
+            column_config={
+                "Odds": st.column_config.NumberColumn(format="%.2f"),
+                "Stake": st.column_config.NumberColumn(format="€%.2f"),
+                "Profit": st.column_config.NumberColumn(format="€%.2f"),
+            },
+        )
+        legs = combo_legs([int(i) for i in combos["id"]])
+        if not legs.empty:
+            with st.expander("What was in each one"):
+                legs["Match"] = legs["home"] + " v " + legs["away"]
+                legs["Bet on"] = legs["selection"].map(plain.PICK_WORDS)
+                legs["Score"] = [f"{int(h)}-{int(a)}" if pd.notna(h) else "-"
+                                 for h, a in zip(legs["fthg"], legs["ftag"], strict=True)]
+                legs["Landed"] = legs["result"].map(
+                    {"won": "Yes", "lost": "No", "void": "Void"}).fillna("Waiting")
+                st.dataframe(
+                    legs[["combo_id", "Match", "Bet on", "odds_taken", "Score", "Landed"]]
+                    .rename(columns={"combo_id": "Bet #", "odds_taken": "Odds"}),
+                    hide_index=True, use_container_width=True,
+                    column_config={"Odds": st.column_config.NumberColumn(format="%.2f")},
+                )
+
+    _record_bet_form()
+
+    if log.empty:
+        glossary()
+        return
+
+    st.subheader("Your single bets")
     view = log.copy()
     view["Match"] = view["home"] + " v " + view["away"]
     view["Bet on"] = view["selection"].map(plain.PICK_WORDS)
@@ -590,6 +655,116 @@ def page_results():
             except (KeyError, ValueError) as exc:
                 st.error(str(exc))
     glossary()
+
+
+RECENT_MATCH_QUERY = """
+SELECT m.id, m.league_code, m.kickoff_utc, m.status,
+       th.canonical_name AS home, ta.canonical_name AS away
+FROM matches m
+JOIN teams th ON th.id = m.home_team_id
+JOIN teams ta ON ta.id = m.away_team_id
+WHERE m.kickoff_utc >= :since
+ORDER BY m.kickoff_utc DESC
+LIMIT 300
+"""
+
+
+@st.cache_data(ttl=300)
+def _selectable_matches():
+    """Recent and upcoming fixtures, for entering a bet you placed yourself."""
+    from sqlalchemy import text as sql_text
+
+    from fv.db.session import get_engine
+
+    since = (datetime.utcnow() - pd.Timedelta(days=14)).isoformat(sep=" ")
+    with get_engine(load_config()).connect() as conn:
+        df = pd.read_sql(sql_text(RECENT_MATCH_QUERY), conn, params={"since": since})
+    if not df.empty:
+        df["kickoff_utc"] = pd.to_datetime(df["kickoff_utc"])
+        df["label"] = (df["kickoff_utc"].dt.strftime("%a %d %b") + " \u00b7 "
+                       + df["home"] + " v " + df["away"])
+    return df
+
+
+def _record_bet_form():
+    """Enter a bet placed at the bookmaker by hand.
+
+    The app cannot see your bookmaker account, so anything placed outside the
+    *This week* button is invisible to it - and a history with holes in it is worse
+    than no history, because the return on screen looks real. This is how to fill
+    them in.
+    """
+    with st.expander("Record a bet you placed yourself"):
+        matches = _selectable_matches()
+        if matches.empty:
+            st.caption("No fixtures loaded yet. Run `uv run fv refresh` first.")
+            return
+
+        if "draft_legs" not in st.session_state:
+            st.session_state.draft_legs = []
+
+        labels = dict(zip(matches["id"], matches["label"], strict=True))
+        c1, c2, c3 = st.columns([3, 2, 1])
+        match_id = c1.selectbox("Match", list(labels), format_func=labels.get)
+        pick = c2.selectbox("What you backed", ["H", "D", "A", "O", "U"],
+                            format_func=lambda s: plain.PICK_WORDS[s])
+        odds = c3.number_input("Odds", min_value=1.01, value=2.00, step=0.01, format="%.2f")
+        if st.button("Add to this bet"):
+            st.session_state.draft_legs.append({
+                "match_id": int(match_id),
+                "market": "OU25" if pick in ("O", "U") else "1X2",
+                "selection": pick,
+                "odds": float(odds),
+                "label": labels[match_id],
+            })
+            st.rerun()
+
+        if not st.session_state.draft_legs:
+            st.caption("Add one selection for a single bet, or several for a combined one.")
+            return
+
+        draft = pd.DataFrame(st.session_state.draft_legs)
+        st.dataframe(
+            draft[["label", "selection", "odds"]]
+            .assign(selection=draft["selection"].map(plain.PICK_WORDS))
+            .rename(columns={"label": "Match", "selection": "Bet on", "odds": "Odds"}),
+            hide_index=True, use_container_width=True,
+        )
+        product = float(draft["odds"].prod())
+        if st.button("Clear these"):
+            st.session_state.draft_legs = []
+            st.rerun()
+
+        c1, c2, c3 = st.columns(3)
+        stake = c1.number_input("Total stake (\u20ac)", min_value=0.01, value=5.00, step=0.50)
+        placed = c2.date_input("Date placed", value=datetime.utcnow().date())
+        real = c3.selectbox("Real money?", [True, False],
+                            format_func=lambda b: "Real money" if b else "Practice")
+
+        if len(draft) > 1:
+            combined = st.number_input(
+                "Combined odds", min_value=1.01, value=round(product, 2), step=0.01,
+                format="%.2f",
+                help="Defaults to the legs multiplied together. Change it to whatever "
+                     "your betting slip actually says - bookmakers round.",
+            )
+            st.caption(f"{_money(stake)} at {combined:.2f} returns "
+                       f"{_money(stake * combined)} if every leg lands. One leg missing "
+                       "and it returns nothing.")
+            if st.button("Save this combined bet", type="primary"):
+                log_combo(draft, stake=stake, combined_odds=float(combined),
+                          mode="real" if real else "paper",
+                          placed_at=datetime.combine(placed, datetime.min.time()),
+                          notes="entered by hand", user_id=_uid())
+                st.session_state.draft_legs = []
+                st.cache_data.clear()
+                st.rerun()
+        elif st.button("Save this single bet", type="primary"):
+            log_slip(draft.assign(stake=stake), mode="real" if real else "paper",
+                     user_id=_uid())
+            st.session_state.draft_legs = []
+            st.cache_data.clear()
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------

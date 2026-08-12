@@ -46,6 +46,13 @@ def _add_market_column(conn) -> str | None:
     return f"bets: added market, marked {result.rowcount} existing bet(s) as 1X2"
 
 
+def _add_combo_column(conn) -> str | None:
+    if "combo_id" in _columns(conn, "bankroll_events"):
+        return None
+    conn.execute(text("ALTER TABLE bankroll_events ADD COLUMN combo_id INTEGER"))
+    return "bankroll_events: added combo_id"
+
+
 def ensure_schema(cfg: Config | None = None) -> list[str]:
     """Create anything missing and migrate anything old. Safe to run every startup."""
     cfg = cfg or load_config()
@@ -56,6 +63,8 @@ def ensure_schema(cfg: Config | None = None) -> list[str]:
     notes: list[str] = []
     if "users" not in existing:
         notes.append("created the users and user_settings tables")
+    if "combo_bets" not in existing:
+        notes.append("created the combined-bet tables")
 
     with engine.connect() as conn:
         needs_owner = any(
@@ -63,6 +72,14 @@ def ensure_schema(cfg: Config | None = None) -> list[str]:
             for table in ("bets", "bankroll_events")
         )
         needs_market = "bets" in existing and "market" not in _columns(conn, "bets")
+        needs_combo = ("bankroll_events" in existing
+                       and "combo_id" not in _columns(conn, "bankroll_events"))
+
+    if needs_combo:
+        with engine.begin() as conn:
+            note = _add_combo_column(conn)
+            if note:
+                notes.append(note)
 
     if needs_market:
         with engine.begin() as conn:

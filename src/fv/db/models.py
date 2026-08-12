@@ -311,6 +311,54 @@ class Bet(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class ComboBet(Base):
+    """A single bet whose outcome depends on several matches at once.
+
+    Kept apart from ``bets`` rather than bolted onto it. A combination is one stake
+    with one outcome, so storing its legs as ordinary bets would count each leg as a
+    bet in every performance figure and — worse — would report a profit on the legs
+    that won when the bet itself returned nothing.
+    """
+
+    __tablename__ = "combo_bets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    ref: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
+    stake: Mapped[float] = mapped_column(Float)
+    # The bookmaker's own combined price. Defaults to the product of the legs, but is
+    # stored rather than derived because bookmakers round, and the slip in your hand
+    # is the authority on what you were actually offered.
+    combined_odds: Mapped[float] = mapped_column(Float)
+    mode: Mapped[str] = mapped_column(String(8), default="paper")  # paper | real
+    placed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    status: Mapped[str] = mapped_column(String(12), default="pending")
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    settled_by: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    legs: Mapped[list["ComboLeg"]] = relationship(
+        back_populates="combo", cascade="all, delete-orphan"
+    )
+
+
+class ComboLeg(Base):
+    """One selection inside a combined bet. Carries no stake of its own."""
+
+    __tablename__ = "combo_legs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    combo_id: Mapped[int] = mapped_column(ForeignKey("combo_bets.id"), index=True)
+    match_id: Mapped[int] = mapped_column(ForeignKey("matches.id"), index=True)
+    market: Mapped[str] = mapped_column(String(16), default="1X2")
+    selection: Mapped[str] = mapped_column(String(8))
+    odds_taken: Mapped[float] = mapped_column(Float)
+    result: Mapped[str | None] = mapped_column(String(8), nullable=True)  # won|lost|void
+
+    combo: Mapped[ComboBet] = relationship(back_populates="legs")
+
+
 class BankrollEvent(Base):
     """Append-only ledger. Balance is derived, never mutated in place."""
 
@@ -323,6 +371,7 @@ class BankrollEvent(Base):
     amount: Mapped[float] = mapped_column(Float)
     balance_after: Mapped[float] = mapped_column(Float)
     bet_id: Mapped[int | None] = mapped_column(ForeignKey("bets.id"), nullable=True)
+    combo_id: Mapped[int | None] = mapped_column(ForeignKey("combo_bets.id"), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

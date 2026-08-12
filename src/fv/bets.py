@@ -13,11 +13,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import pandas as pd
-from sqlalchemy import func, select, text
+from sqlalchemy import bindparam, func, select, text
 
 from fv.auth import local_user_id
 from fv.config import Config, load_config
-from fv.db.models import BankrollEvent, Bet, Match
+from fv.db.models import BankrollEvent, Bet, ComboBet, ComboLeg, Match
 from fv.db.session import get_engine, session_scope
 from fv.odds.settlement import clv as clv_of
 from fv.odds.settlement import settle_bet
@@ -45,7 +45,13 @@ def current_bankroll(cfg: Config | None = None, user_id: int | None = None) -> f
         )
         if last is not None:
             return float(last.balance_after)
-    return float(cfg.betting.get("starting_bankroll", 1000.0))
+    # Before any ledger entry the balance is whatever the user said they started
+    # with. Reading only config.yaml here ignored the figure they set on the
+    # Settings page, so the number on screen was not the number they chose.
+    from fv.settings_store import get_setting
+
+    default = float(cfg.betting.get("starting_bankroll", 1000.0))
+    return float(get_setting("starting_bankroll", default, cfg, uid))
 
 
 def record_bankroll_event(
@@ -143,8 +149,22 @@ class SettlementStats:
         )
 
 
+def settle_all(cfg: Config | None = None) -> SettlementStats:
+    """Settle singles and combined bets in one pass, and add up both."""
+    singles = settle_pending(cfg)
+    combos = settle_combos(cfg)
+    return SettlementStats(
+        settled=singles.settled + combos.settled,
+        won=singles.won + combos.won,
+        lost=singles.lost + combos.lost,
+        void=singles.void + combos.void,
+        pnl=singles.pnl + combos.pnl,
+        still_pending=singles.still_pending + combos.still_pending,
+    )
+
+
 def settle_pending(cfg: Config | None = None) -> SettlementStats:
-    """Settle every pending bet whose match now has a result.
+    """Settle every pending single bet whose match now has a result.
 
     Also records CLV where a closing price has arrived, which is what makes the
     Bankroll page's CLV column fill in as results load.
@@ -156,7 +176,10 @@ def settle_pending(cfg: Config | None = None) -> SettlementStats:
         pending = s.scalars(select(Bet).where(Bet.status == "pending")).all()
         for bet in pending:
             match = s.get(Match, bet.match_id)
-            if match is None or match.status != "played" or match.fthg is None:
+            # Still to be played is pending. Played-with-no-score, or explicitly
+            # void, is an abandoned match: that settles as a void and returns the
+            # stake, rather than sitting pending forever.
+            if match is None or match.status == "scheduled":
                 stats.still_pending += 1
                 continue
 
@@ -333,3 +356,196 @@ def rolling_roi(bets: pd.DataFrame, window: int = 300, min_periods: int = 30) ->
             "ci_high": roi + 1.96 * se,
         })
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Combined bets
+# ---------------------------------------------------------------------------
+
+def log_combo(
+    legs: pd.DataFrame,
+    stake: float,
+    combined_odds: float | None = None,
+    mode: str = "paper",
+    ref: str | None = None,
+    placed_at: datetime | None = None,
+    notes: str | None = None,
+    cfg: Config | None = None,
+    user_id: int | None = None,
+) -> int:
+    """Record one stake riding on several matches at once. Returns the combo id.
+
+    ``combined_odds`` defaults to the product of the legs. Pass the bookmaker's own
+    figure when you have it: they round, and the slip in your hand is the authority
+    on what you were actually offered.
+    """
+    if legs.empty:
+        raise ValueError("a combined bet needs at least one leg")
+    if stake <= 0:
+        raise ValueError(f"stake must be positive, got {stake}")
+    cfg = cfg or load_config()
+    uid = user_id if user_id is not None else local_user_id(cfg)
+    odds = float(combined_odds) if combined_odds else float(legs["odds"].prod())
+    if odds <= 1.0:
+        raise ValueError(f"combined odds must be > 1.0, got {odds}")
+
+    with session_scope(cfg) as s:
+        combo = ComboBet(
+            user_id=uid,
+            ref=ref or f"combo-{datetime.utcnow():%Y%m%d}-{uuid.uuid4().hex[:6]}",
+            stake=float(stake),
+            combined_odds=odds,
+            mode=mode,
+            placed_at=placed_at or datetime.utcnow(),
+            status="pending",
+            notes=notes,
+        )
+        s.add(combo)
+        s.flush()
+        for r in legs.itertuples(index=False):
+            s.add(
+                ComboLeg(
+                    combo_id=combo.id,
+                    match_id=int(r.match_id),
+                    market=getattr(r, "market", "1X2"),
+                    selection=r.selection,
+                    odds_taken=float(r.odds),
+                )
+            )
+        return combo.id
+
+
+def settle_combos(cfg: Config | None = None) -> SettlementStats:
+    """Settle combined bets whose matches have all finished.
+
+    A combination is all-or-nothing, with one exception that is not a detail: a
+    voided leg drops out and the price is recomputed from the legs that remain,
+    which is what bookmakers actually do. Treating a void as a loss would take money
+    the bet never risked.
+    """
+    cfg = cfg or load_config()
+    stats = SettlementStats()
+    settled: list[tuple[int, float]] = []
+
+    with session_scope(cfg) as s:
+        pending = s.scalars(select(ComboBet).where(ComboBet.status == "pending")).all()
+        for combo in pending:
+            legs = s.scalars(select(ComboLeg).where(ComboLeg.combo_id == combo.id)).all()
+            outcomes = []
+            for leg in legs:
+                match = s.get(Match, leg.match_id)
+                if match is None or match.status == "scheduled":
+                    outcomes = None
+                    break
+                result = settle_bet(leg.market or "1X2", leg.selection, 1.0,
+                                    leg.odds_taken, match.fthg, match.ftag)
+                leg.result = result.status
+                outcomes.append((leg, result.status))
+            if outcomes is None:
+                stats.still_pending += 1
+                continue
+
+            live = [(leg, r) for leg, r in outcomes if r != "void"]
+            if not live:
+                combo.status, combo.pnl = "void", 0.0
+            elif all(r == "won" for _, r in live):
+                # Recompute from the surviving legs so a void reduces the price
+                # rather than the stake.
+                price = 1.0
+                for leg, _ in live:
+                    price *= leg.odds_taken
+                if len(live) == len(outcomes):
+                    price = combo.combined_odds
+                combo.status = "won"
+                combo.pnl = round(combo.stake * (price - 1.0), 2)
+            else:
+                combo.status, combo.pnl = "lost", -round(combo.stake, 2)
+
+            combo.settled_at = datetime.utcnow()
+            combo.settled_by = "auto"
+            stats.settled += 1
+            stats.pnl += combo.pnl
+            if combo.status == "won":
+                stats.won += 1
+            elif combo.status == "lost":
+                stats.lost += 1
+            else:
+                stats.void += 1
+            settled.append((combo.id, combo.pnl, combo.user_id))
+
+    for combo_id, pnl, uid in settled:
+        if not _has_combo_ledger_entry(combo_id, cfg):
+            _record_combo_settlement(combo_id, pnl, uid, cfg)
+    return stats
+
+
+def _has_combo_ledger_entry(combo_id: int, cfg: Config | None = None) -> bool:
+    cfg = cfg or load_config()
+    with session_scope(cfg) as s:
+        return (s.scalar(select(func.count(BankrollEvent.id)).where(
+            BankrollEvent.combo_id == combo_id)) or 0) > 0
+
+
+def _record_combo_settlement(combo_id: int, pnl: float, uid: int, cfg: Config) -> None:
+    balance = current_bankroll(cfg, uid) + pnl
+    with session_scope(cfg) as s:
+        s.add(
+            BankrollEvent(
+                user_id=uid,
+                ts=datetime.utcnow(),
+                type="settlement",
+                amount=float(pnl),
+                balance_after=float(balance),
+                combo_id=combo_id,
+                note=f"combined bet {combo_id}",
+            )
+        )
+
+
+COMBO_LOG_QUERY = """
+SELECT c.id, c.ref, c.stake, c.combined_odds, c.mode, c.status, c.pnl,
+       c.placed_at, c.settled_at, c.notes, c.user_id,
+       COUNT(l.id) AS legs,
+       SUM(CASE WHEN l.result = 'won' THEN 1 ELSE 0 END) AS legs_won
+FROM combo_bets c
+LEFT JOIN combo_legs l ON l.combo_id = c.id
+WHERE (:user_id IS NULL OR c.user_id = :user_id)
+GROUP BY c.id
+ORDER BY c.placed_at DESC, c.id DESC
+"""
+
+COMBO_LEG_QUERY = """
+SELECT l.combo_id, l.market, l.selection, l.odds_taken, l.result,
+       m.league_code, m.kickoff_utc, m.fthg, m.ftag,
+       th.canonical_name AS home, ta.canonical_name AS away
+FROM combo_legs l
+JOIN matches m ON m.id = l.match_id
+JOIN teams th ON th.id = m.home_team_id
+JOIN teams ta ON ta.id = m.away_team_id
+WHERE l.combo_id IN :ids
+ORDER BY m.kickoff_utc
+"""
+
+
+def combo_log(cfg: Config | None = None, user_id: int | None = None) -> pd.DataFrame:
+    cfg = cfg or load_config()
+    with get_engine(cfg).connect() as conn:
+        df = pd.read_sql(text(COMBO_LOG_QUERY), conn, params={"user_id": user_id})
+    if not df.empty:
+        for col in ("placed_at", "settled_at"):
+            df[col] = pd.to_datetime(df[col])
+    return df
+
+
+def combo_legs(combo_ids: list[int], cfg: Config | None = None) -> pd.DataFrame:
+    if not combo_ids:
+        return pd.DataFrame()
+    cfg = cfg or load_config()
+    with get_engine(cfg).connect() as conn:
+        df = pd.read_sql(
+            text(COMBO_LEG_QUERY).bindparams(bindparam("ids", expanding=True)),
+            conn, params={"ids": [int(i) for i in combo_ids]},
+        )
+    if not df.empty:
+        df["kickoff_utc"] = pd.to_datetime(df["kickoff_utc"])
+    return df
