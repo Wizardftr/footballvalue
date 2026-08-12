@@ -227,18 +227,24 @@ def page_this_week():
     table["Odds"] = table["odds"]
     table["Returns"] = table["stake"] * table["odds"]
 
-    st.dataframe(
-        table[["Kick-off", "League", "Match", "Market", "Bet on", "Odds", "Stake",
-               "Returns"]],
-        hide_index=True, use_container_width=True,
-        column_config={
-            "Odds": st.column_config.NumberColumn(format="%.2f"),
-            "Stake": st.column_config.NumberColumn(format="€%.2f"),
-            "Returns": st.column_config.NumberColumn(
-                "Returns if it wins", format="€%.2f",
-                help="Your stake back plus the profit."),
-        },
-    )
+    # Grouped by day, because that is how they get placed: you sit down once per
+    # matchday, not once per week.
+    table["day"] = pd.to_datetime(table["kickoff_utc"]).dt.normalize()
+    table["Time"] = pd.to_datetime(table["kickoff_utc"]).dt.strftime("%H:%M")
+    for day, group in table.groupby("day", sort=True):
+        theme.day_heading(day.strftime("%A %-d %B"), len(group))
+        st.dataframe(
+            group.sort_values("kickoff_utc")[
+                ["Time", "League", "Match", "Market", "Bet on", "Odds", "Stake", "Returns"]],
+            hide_index=True, use_container_width=True,
+            column_config={
+                "Odds": st.column_config.NumberColumn(format="%.2f"),
+                "Stake": st.column_config.NumberColumn(format="€%.2f"),
+                "Returns": st.column_config.NumberColumn(
+                    "Returns if it wins", format="€%.2f",
+                    help="Your stake back plus the profit."),
+            },
+        )
 
     c1, c2, c3 = st.columns([1, 1, 2])
     c1.download_button("Save as text", slip_to_text(slip),
@@ -449,7 +455,11 @@ def page_track_record():
         st.subheader("How a €10 bet on every pick would have gone")
         curve = bets.sort_values("kickoff_utc").copy()
         curve["Running profit (€)"] = curve["pnl"].cumsum()
-        st.line_chart(curve.set_index("kickoff_utc")["Running profit (€)"])
+        st.altair_chart(
+            theme.line_chart(curve, "kickoff_utc", "Running profit (€)",
+                             y_title="Running profit (€)", zero_line=True),
+            use_container_width=True,
+        )
         worst = (curve["Running profit (€)"] - curve["Running profit (€)"].cummax()).min()
         st.caption(
             f"Worst losing run: **{_money(abs(worst))}** below the best point it had "
@@ -611,12 +621,11 @@ def page_results():
         if not roll.empty:
             chart = roll.copy()
             chart["date"] = pd.to_datetime(chart["kickoff_utc"]).dt.normalize()
-            chart = chart.rename(columns={"roi": "Return", "ci_low": "Could be as low as",
-                                          "ci_high": "Could be as high as"})
-            for col in ("Return", "Could be as low as", "Could be as high as"):
-                chart[col] = chart[col] * 100
-            st.line_chart(chart.set_index("date")[
-                ["Return", "Could be as low as", "Could be as high as"]])
+            st.altair_chart(
+                theme.band_chart(chart, "date", "roi", "ci_low", "ci_high",
+                                 y_title="Return"),
+                use_container_width=True,
+            )
             last = roll.iloc[-1]
             st.caption(
                 f"Latest: **{_pct(last['roi'])}** over {int(last['n'])} picks, but "
@@ -636,7 +645,9 @@ def page_results():
             monthly = m.groupby("Month").agg(Picks=("pnl", "size"),
                                              Staked=("stake", "sum"),
                                              Profit=("pnl", "sum")).reset_index()
-            st.bar_chart(monthly.set_index("Month")["Profit"])
+            st.altair_chart(theme.bar_chart(monthly, "Month", "Profit",
+                                            y_title="Profit (€)"),
+                            use_container_width=True)
             st.dataframe(monthly, hide_index=True, use_container_width=True)
 
     with st.expander("Money in and out"):
