@@ -92,6 +92,20 @@ def _league_names() -> dict[str, str]:
     return {lg.code: lg.name for lg in load_config().leagues}
 
 
+def _saved(message: str = "Saved.") -> None:
+    """Confirm a write, then redraw the whole page.
+
+    The sidebar is rendered before the page body, so anything it shows — the
+    balance, the practice-mode line — is drawn from the values that were in force
+    *before* the button was pressed. Without a rerun the save looks like it did
+    nothing, which is exactly how it was reported. A toast survives the rerun; an
+    st.success would be wiped out by it.
+    """
+    st.cache_data.clear()
+    st.toast(message, icon="✅")
+    st.rerun()
+
+
 def glossary():
     with st.expander("What do these words mean?"):
         for term, meaning in plain.GLOSSARY:
@@ -238,8 +252,7 @@ def page_this_week():
     if c3.button(label, type="primary", use_container_width=True):
         slip_id, n = log_slip(slip.selections, mode="paper" if practice else "real",
                               user_id=_uid())
-        st.cache_data.clear()
-        st.success(f"Saved {n} picks. Results fill in automatically as matches finish.")
+        _saved(f"Saved {n} picks. Results fill in as the matches finish.")
 
     if len(slip.selections) > 1:
         _combination_panel(slip)
@@ -793,7 +806,7 @@ def page_settings():
         )
     if st.button("Save"):
         set_setting("paper_mode", bool(practice), user_id=_uid())
-        st.success("Saved.")
+        _saved()
 
     st.divider()
     st.subheader("How much to stake")
@@ -824,8 +837,7 @@ def page_settings():
         for key, value in {**preset, "starting_bankroll": balance,
                            "enabled_leagues": leagues}.items():
             set_setting(key, value, user_id=_uid())
-        st.cache_data.clear()
-        st.success("Saved.")
+        _saved()
 
     with st.expander("Advanced — the individual numbers"):
         st.caption("The three styles above are shortcuts for these. Change them here if "
@@ -858,8 +870,7 @@ def page_settings():
                 "weekly_stop_loss_pct": stop_loss, "max_drawdown_pct": max_dd,
             }.items():
                 set_setting(key, value, user_id=_uid())
-            st.cache_data.clear()
-            st.success("Saved.")
+            _saved()
     glossary()
 
 
