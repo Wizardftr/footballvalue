@@ -382,15 +382,29 @@ def settle():
 
 
 @app.command()
-def dashboard(port: int = typer.Option(8501, help="Port to serve on.")):
-    """Launch the Streamlit dashboard."""
+def dashboard(
+    port: int = typer.Option(8501, help="Port to serve on."),
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open a browser window. Off when serving remotely."
+    ),
+):
+    """Launch the app. Creates or migrates the database first if it needs it."""
     import subprocess
     import sys
 
+    from fv.db.migrate import ensure_schema
+
+    # Run the migration here rather than only inside the app: if it fails, the error
+    # belongs in the terminal where it can be read, not behind a browser stack trace.
+    for note in ensure_schema(load_config()):
+        console.print(f"[green]•[/green] {note}")
+
     app_path = Path(__file__).parent / "app" / "dashboard.py"
+    console.print(f"[bold]Opening http://localhost:{port}[/bold]  (press Ctrl+C to stop)")
     subprocess.run(
         [sys.executable, "-m", "streamlit", "run", str(app_path),
-         "--server.port", str(port), "--server.headless", "true"],
+         "--server.port", str(port),
+         "--server.headless", "false" if open_browser else "true"],
         check=False,
     )
 

@@ -32,9 +32,7 @@ uv run fv stages                     # all five model stages + comparison table
 uv run fv fixtures                   # upcoming fixtures + bet365 prices
 uv run fv slip --log                 # this week's slip, logged as paper bets
 uv run fv settle                     # auto-settle bets whose results have arrived
-uv run fv migrate                    # bring an older database up to date
-uv run fv user add you@example.com --owner   # create your sign-in account
-uv run fv dashboard                  # Streamlit UI on localhost:8501
+uv run fv dashboard                  # the app: migrates, then opens localhost:8501
 
 uv run fv markets                    # over/under 2.5 backtest + BTTS calibration
 uv run fv live-odds                  # The Odds API snapshots (needs ODDS_API_KEY)
@@ -227,7 +225,9 @@ tests/
 
 ## The dashboard
 
-`uv run fv dashboard`, then sign in. Seven pages:
+`uv run fv dashboard`, then sign in. It migrates the database if needed and
+opens a browser. The first run offers to create your account; after that the
+owner invites everyone else. Seven pages:
 
 - **This Week** — fixtures, model vs bet365, edge per selection, the recommended slip
   with stakes, and text/CSV export for placing by hand. It also lists every selection
